@@ -8,7 +8,7 @@ Um jogo de quebra-cabeça educativo no estilo Game Boy Advance. Você é John Ch
 
 Baixe o arquivo `feed-the-machine.html` e abra no navegador (Chrome, Edge, Firefox). Não precisa instalar nada nem rodar servidor: o jogo inteiro, incluindo as imagens, está nesse único arquivo.
 
-O som começa depois da primeira tecla (regra dos navegadores), então aperte Enter na tela de título.
+O som começa depois da primeira tecla, então aperte Enter na tela de título.
 
 ## Controles
 
@@ -44,34 +44,6 @@ Cada caixa entregue na calha certa vira um token. Cada erro dá uma advertência
 ```
 <ID,RES> <OP,=> <ID,A1> <OP,+> <ID,B2> <OP,*> <NUM,10> <SYM,;>
 ```
-
-## Computação gráfica
-
-O jogo não usa engine nem bibliotecas gráficas. Tudo é desenhado pixel a pixel num framebuffer de cores indexadas de 240×160, com uma paleta de 5 cores:
-
-- **Primitivas próprias:** retângulos, linhas com o algoritmo de Bresenham e o arco do mostrador do elevador com o algoritmo do ponto médio para círculos.
-- **Fonte bitmap 3×5** feita à mão, com quebra de linha.
-- **Sprites:** os PNGs desenhados no Aseprite são convertidos na carga, e cada pixel vira a cor mais próxima da paleta (quantização por distância euclidiana no espaço RGB).
-- **Cenário procedural:** concreto, paredes e manchas gerados por um hash determinístico.
-- **Efeitos:** fade entre cenas, tremor de tela e partículas com velocidade e gravidade.
-- **Som:** um sintetizador por software gera ondas quadrada, dente de serra, triangular e ruído, amostra por amostra.
-
-O navegador só entra no fim do processo: mostra o framebuffer num `<canvas>`, ampliado por um fator inteiro para os pixels ficarem nítidos, lê o teclado e toca o áudio. O jogo roda num loop fixo de 60 atualizações por segundo, independente da taxa de atualização do monitor.
-
-## Organização do código
-
-O `feed-the-machine.html` é uma conversão para JavaScript de uma versão em C++17 com SDL2. O script está dividido em seções, cada uma correspondendo a um módulo da versão original:
-
-| Seção | O que faz |
-| --- | --- |
-| `core/` | Canvas e paleta, fonte, sprites, entrada, sintetizador, utilitários |
-| `compiler/Lexer` | O scanner, independente do jogo |
-| `game/` | Gerenciador de cenas e fades, caixa de diálogo, efeitos sonoros |
-| `game/scenes/` | Título, elevador, relatório do andar, tela final |
-| `game/floor/` | O que todo andar tem: funcionário, HUD, advertências, prancheta, pausa, elevador |
-| `game/floor1/` | Andar 1: esteira, caixas, calhas, triturador e as regras de triagem |
-| `game/floor6/` | Andar 6: a sequência do Boss, uma pequena máquina de estados |
-| `platform/` | A única parte que fala com o navegador: canvas, teclado, áudio e o loop principal |
 
 ## Licença
 
