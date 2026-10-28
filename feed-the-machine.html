@@ -1,0 +1,2319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FEED THE MACHINE - Floor 1: Sorting</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { image-rendering: pixelated; image-rendering: crisp-edges; display: block; }
+</style>
+</head>
+<body>
+<canvas id="screen" width="240" height="160"></canvas>
+<script>
+// FEED THE MACHINE - an educational puzzle game about compilers,
+// in Game Boy Advance style, written without a game engine.
+//
+// Browser port of the C++17/SDL2 version in src/. Same structure, file by file:
+// every tile, sprite and letter is drawn pixel by pixel into a 240x160
+// indexed-color framebuffer; the browser only opens the "window" (a <canvas>),
+// reads the keyboard, plays the audio and scales the finished image.
+'use strict';
+
+// =============================================================================
+// core/Canvas
+// =============================================================================
+
+const SCREEN_W = 240;  // Game Boy Advance resolution
+const SCREEN_H = 160;
+
+// Palette indices. Vivid is reserved for whatever the player can interact
+// with (and for text), so the eye always knows where it can act.
+const Ink = 0;    // near black: outlines and shadows
+const Dark = 1;   // dark concrete
+const Light = 2;  // light concrete, details
+const Vivid = 3;  // interactive objects and text
+const Alert = 4;  // warnings and the flamethrower only
+
+const PALETTE = [
+  [16, 32, 20], [52, 82, 52], [110, 146, 82], [196, 240, 92], [242, 140, 40],
+];
+
+// Indexed-color framebuffer: one byte (a palette index) per pixel.
+// Every drawing routine in the game writes into one of these.
+class Canvas {
+  constructor() { this.px = new Uint8Array(SCREEN_W * SCREEN_H); }
+
+  clear(color = Ink) { this.px.fill(color); }
+  copyFrom(other) { this.px.set(other.px); }
+
+  pixel(x, y, color) {
+    if (x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H) this.px[y * SCREEN_W + x] = color;
+  }
+
+  at(x, y) {
+    if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) return Ink;
+    return this.px[y * SCREEN_W + x];
+  }
+
+  rect(x, y, w, h, color) {
+    for (let j = 0; j < h; j++)
+      for (let i = 0; i < w; i++) this.pixel(x + i, y + j, color);
+  }
+
+  outline(x, y, w, h, color) {
+    for (let i = 0; i < w; i++) {
+      this.pixel(x + i, y, color);
+      this.pixel(x + i, y + h - 1, color);
+    }
+    for (let j = 0; j < h; j++) {
+      this.pixel(x, y + j, color);
+      this.pixel(x + w - 1, y + j, color);
+    }
+  }
+
+  // Bresenham
+  line(x0, y0, x1, y1, color) {
+    const dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    const dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    let err = dx + dy;
+    for (;;) {
+      this.pixel(x0, y0, color);
+      if (x0 === x1 && y0 === y1) break;
+      const e2 = 2 * err;
+      if (e2 >= dy) { err += dy; x0 += sx; }
+      if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+  }
+
+  // Midpoint circle, top half only
+  upperArc(cx, cy, r, color) {
+    let x = r, y = 0, err = 1 - r;
+    while (x >= y) {
+      this.pixel(cx + x, cy - y, color);
+      this.pixel(cx - x, cy - y, color);
+      this.pixel(cx + y, cy - x, color);
+      this.pixel(cx - y, cy - x, color);
+      y++;
+      if (err < 0) {
+        err += 2 * y + 1;
+      } else {
+        x--;
+        err += 2 * (y - x) + 1;
+      }
+    }
+  }
+
+  // Resolves palette indices to RGBA, applying a fade (0..1) and an offset (screen shake).
+  toRgba(out, brightness, offsetX = 0, offsetY = 0) {
+    const lut = PALETTE.map(([r, g, b]) =>
+      [Math.floor(r * brightness), Math.floor(g * brightness), Math.floor(b * brightness)]);
+    let o = 0;
+    for (let y = 0; y < SCREEN_H; y++)
+      for (let x = 0; x < SCREEN_W; x++) {
+        const idx = this.at(x - offsetX, y - offsetY);
+        const c = lut[idx < lut.length ? idx : 0];
+        out[o++] = c[0];
+        out[o++] = c[1];
+        out[o++] = c[2];
+        out[o++] = 255;
+      }
+  }
+}
+
+// =============================================================================
+// core/MathUtil, core/Random
+// =============================================================================
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// Cheap deterministic hash, used for concrete speckles and lit windows.
+// (uint32 arithmetic, like the C++ version: Math.imul + >>> 0)
+function hash2(x, y) {
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263)) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+// Uniform number in [0, 1). Xorshift.
+let randState = 0x9E3779B9;
+function rand01() {
+  randState = (randState ^ (randState << 13)) >>> 0;
+  randState = (randState ^ (randState >>> 17)) >>> 0;
+  randState = (randState ^ (randState << 5)) >>> 0;
+  return (randState >>> 8) / 16777216;
+}
+
+// =============================================================================
+// core/Font - 3x5 bitmap font, uppercase only, drawn pixel by pixel.
+// =============================================================================
+
+const VISIBLE_SPACE = '\x01';  // the little "space" symbol printed on boxes
+
+const font = (() => {
+  // Each glyph is 5 rows of 3 pixels, separated by '|'.
+  const GLYPHS = {
+    'A': '.#.|#.#|###|#.#|#.#', 'B': '##.|#.#|##.|#.#|##.', 'C': '.##|#..|#..|#..|.##',
+    'D': '##.|#.#|#.#|#.#|##.', 'E': '###|#..|##.|#..|###', 'F': '###|#..|##.|#..|#..',
+    'G': '.##|#..|#.#|#.#|.##', 'H': '#.#|#.#|###|#.#|#.#', 'I': '###|.#.|.#.|.#.|###',
+    'J': '..#|..#|..#|#.#|.#.', 'K': '#.#|#.#|##.|#.#|#.#', 'L': '#..|#..|#..|#..|###',
+    'M': '#.#|###|###|#.#|#.#', 'N': '##.|#.#|#.#|#.#|#.#', 'O': '.#.|#.#|#.#|#.#|.#.',
+    'P': '##.|#.#|##.|#..|#..', 'Q': '.#.|#.#|#.#|##.|.##', 'R': '##.|#.#|##.|#.#|#.#',
+    'S': '.##|#..|.#.|..#|##.', 'T': '###|.#.|.#.|.#.|.#.', 'U': '#.#|#.#|#.#|#.#|###',
+    'V': '#.#|#.#|#.#|#.#|.#.', 'W': '#.#|#.#|###|###|#.#', 'X': '#.#|#.#|.#.|#.#|#.#',
+    'Y': '#.#|#.#|.#.|.#.|.#.', 'Z': '###|..#|.#.|#..|###',
+    '0': '###|#.#|#.#|#.#|###', '1': '.#.|##.|.#.|.#.|###', '2': '##.|..#|.#.|#..|###',
+    '3': '##.|..#|.#.|..#|##.', '4': '#.#|#.#|###|..#|..#', '5': '###|#..|##.|..#|##.',
+    '6': '.##|#..|###|#.#|###', '7': '###|..#|.#.|.#.|.#.', '8': '###|#.#|###|#.#|###',
+    '9': '###|#.#|###|..#|##.',
+    '.': '...|...|...|...|.#.', ',': '...|...|...|.#.|#..', ':': '...|.#.|...|.#.|...',
+    ';': '...|.#.|...|.#.|#..', '!': '.#.|.#.|.#.|...|.#.', '?': '##.|..#|.#.|...|.#.',
+    '-': '...|...|###|...|...', '+': '...|.#.|###|.#.|...', '*': '...|#.#|.#.|#.#|...',
+    '/': '..#|..#|.#.|#..|#..', '=': '...|###|...|###|...', '(': '..#|.#.|.#.|.#.|..#',
+    ')': '#..|.#.|.#.|.#.|#..', '<': '..#|.#.|#..|.#.|..#', '>': '#..|.#.|..#|.#.|#..',
+    '\'': '.#.|.#.|...|...|...', '"': '#.#|#.#|...|...|...', '_': '...|...|...|...|###',
+    '[': '##.|#..|#..|#..|##.', ']': '.##|..#|..#|..#|.##', '%': '#.#|..#|.#.|#..|#.#',
+    '#': '#.#|###|#.#|###|#.#', [VISIBLE_SPACE]: '...|...|...|#.#|###',
+  };
+
+  function upper(text) { return text.toUpperCase(); }
+
+  function drawGlyph(canvas, c, x, y, color, scale = 1) {
+    const p = GLYPHS[c.toUpperCase()];
+    if (!p) return;
+    for (let j = 0; j < 5; j++)
+      for (let i = 0; i < 3; i++)
+        if (p[j * 4 + i] === '#') canvas.rect(x + i * scale, y + j * scale, scale, scale, color);
+  }
+
+  function drawText(canvas, text, x, y, color, scale = 1) {
+    for (const c of text) {
+      drawGlyph(canvas, c, x, y, color, scale);
+      x += 4 * scale;
+    }
+  }
+
+  function width(text, scale = 1) {
+    return text.length === 0 ? 0 : (text.length * 4 - 1) * scale;
+  }
+
+  function drawCentered(canvas, text, y, color, scale = 1) {
+    drawText(canvas, text, Math.trunc((SCREEN_W - width(text, scale)) / 2), y, color, scale);
+  }
+
+  // Word-wraps into lines of at most maxChars; '\n' forces a break.
+  function wrap(text, maxChars) {
+    const out = [];
+    for (const paragraph of upper(text).split('\n')) {
+      let current = '';
+      for (const w of paragraph.split(' ')) {
+        if (current.length === 0) current = w;
+        else if (current.length + 1 + w.length <= maxChars) current += ' ' + w;
+        else { out.push(current); current = w; }
+      }
+      out.push(current);
+    }
+    return out;
+  }
+
+  return { upper, drawGlyph, drawText, width, drawCentered, wrap };
+})();
+
+// =============================================================================
+// core/Sprite
+// =============================================================================
+
+// A grid of palette indices, same shape as the Canvas it gets blit onto.
+// TRANSPARENT pixels are skipped by blit() instead of drawn.
+class Sprite {
+  constructor(w, h, data) {
+    this.w = w;
+    this.h = h;
+    this.data = data;
+  }
+
+  // '.' is transparent, '0'..'4' are palette indices - lets small sprites
+  // live as plain text next to the code that uses them.
+  static fromRows(rows) {
+    if (rows.length === 0) throw new Error('Sprite: no rows');
+    const h = rows.length, w = rows[0].length;
+    const data = new Uint8Array(w * h);
+    let k = 0;
+    for (const row of rows) {
+      if (row.length !== w) throw new Error('Sprite: rows of different widths');
+      for (const ch of row) data[k++] = ch === '.' ? Sprite.TRANSPARENT : ch.charCodeAt(0) - 48;
+    }
+    return new Sprite(w, h, data);
+  }
+
+  // Takes a decoded PNG (e.g. exported from Aseprite) and maps every pixel to
+  // the nearest color in PALETTE; pixels with alpha < 128 become TRANSPARENT.
+  static fromImage(img) {
+    const w = img.naturalWidth, h = img.naturalHeight;
+    const off = document.createElement('canvas');
+    off.width = w;
+    off.height = h;
+    const ctx = off.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    const rgba = ctx.getImageData(0, 0, w, h).data;
+    const data = new Uint8Array(w * h);
+    for (let i = 0; i < data.length; i++) {
+      const p = i * 4;
+      data[i] = rgba[p + 3] < 128 ? Sprite.TRANSPARENT : nearestPaletteIndex(rgba[p], rgba[p + 1], rgba[p + 2]);
+    }
+    return new Sprite(w, h, data);
+  }
+}
+Sprite.TRANSPARENT = 255;
+
+// Index of the PALETTE entry closest to (r, g, b) in squared distance - the
+// simplest form of color quantization: snap an arbitrary RGB pixel onto a
+// small, fixed palette.
+function nearestPaletteIndex(r, g, b) {
+  let best = 0, bestDist = Infinity;
+  for (let i = 0; i < PALETTE.length; i++) {
+    const c = PALETTE[i];
+    const dr = c[0] - r, dg = c[1] - g, db = c[2] - b;
+    const dist = dr * dr + dg * dg + db * db;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = i;
+    }
+  }
+  return best;
+}
+
+// A sub-rectangle of a larger sprite - pulling one frame out of a sheet.
+function crop(sheet, x, y, w, h) {
+  if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > sheet.w || y + h > sheet.h)
+    throw new Error('Sprite crop: rectangle outside the sheet');
+  const data = new Uint8Array(w * h);
+  for (let j = 0; j < h; j++)
+    for (let i = 0; i < w; i++) data[j * w + i] = sheet.data[(y + j) * sheet.w + (x + i)];
+  return new Sprite(w, h, data);
+}
+
+// Copies a sprite into the canvas, skipping transparent pixels.
+// forceColor >= 0 paints every opaque pixel with that index (silhouettes).
+function blit(canvas, s, x, y, flipX = false, forceColor = -1) {
+  for (let j = 0; j < s.h; j++)
+    for (let i = 0; i < s.w; i++) {
+      const v = s.data[j * s.w + (flipX ? s.w - 1 - i : i)];
+      if (v !== Sprite.TRANSPARENT) canvas.pixel(x + i, y + j, forceColor < 0 ? v : forceColor);
+    }
+}
+
+// =============================================================================
+// core/Input
+// =============================================================================
+
+// The game only knows the GBA's buttons; the platform layer maps real keys to them.
+// A = Z (pick up / interact), B = X (clipboard / cancel), Start = Enter.
+const Key = { Up: 0, Down: 1, Left: 2, Right: 3, A: 4, B: 5, Start: 6, Count: 7 };
+
+class Input {
+  constructor() {
+    this.held_ = new Array(Key.Count).fill(false);
+    this.pressed_ = new Array(Key.Count).fill(false);
+  }
+  press(k) {
+    if (!this.held_[k]) this.pressed_[k] = true;
+    this.held_[k] = true;
+  }
+  release(k) { this.held_[k] = false; }
+  releaseAll() { this.held_.fill(false); }
+
+  held(k) { return this.held_[k]; }        // down right now
+  pressed(k) { return this.pressed_[k]; }  // went down since the last step
+
+  endStep() { this.pressed_.fill(false); }  // call after every fixed update step
+}
+
+// =============================================================================
+// core/Synth - a tiny software synthesizer, mixed by hand like a Game Boy sound chip.
+// =============================================================================
+
+const Wave = { Square: 0, Saw: 1, Triangle: 2, Noise: 3 };
+
+class Synth {
+  constructor() {
+    this.voices = [];
+    for (let i = 0; i < 48; i++) this.voices.push({ on: false, tone: null, t: 0, phase: 0, delay: 0 });
+    this.noiseState = 0x2545F491;
+  }
+
+  // tone: { freq, duration, wave, volume, slideTo, delay }
+  play(tone) {
+    for (const v of this.voices) {
+      if (v.on) continue;
+      v.on = true;
+      v.tone = tone;
+      v.t = 0;
+      v.phase = 0;
+      v.delay = tone.delay;
+      return;
+    }
+  }
+
+  render(out, frames, sampleRate) {
+    const dt = 1 / sampleRate;
+    for (let i = 0; i < frames; i++) {
+      let mix = 0;
+      for (const v of this.voices) {
+        if (!v.on) continue;
+        if (v.delay > 0) { v.delay -= dt; continue; }
+        const tn = v.tone;
+        const p = v.t / tn.duration;
+        if (p >= 1) { v.on = false; continue; }
+
+        const f = tn.slideTo > 0 ? tn.freq * Math.pow(tn.slideTo / tn.freq, p) : tn.freq;
+        v.phase += f * dt;
+        v.phase -= Math.floor(v.phase);
+
+        let w = 0;
+        switch (tn.wave) {
+          case Wave.Square: w = v.phase < 0.5 ? 1 : -1; break;
+          case Wave.Saw: w = 2 * v.phase - 1; break;
+          case Wave.Triangle: w = 4 * Math.abs(v.phase - 0.5) - 1; break;
+          case Wave.Noise:
+            this.noiseState = (this.noiseState ^ (this.noiseState << 13)) >>> 0;
+            this.noiseState = (this.noiseState ^ (this.noiseState >>> 17)) >>> 0;
+            this.noiseState = (this.noiseState ^ (this.noiseState << 5)) >>> 0;
+            w = (this.noiseState >>> 8) / 8388608 - 1;
+            break;
+        }
+        // Exponential decay for tones, linear for noise bursts
+        const env = tn.wave === Wave.Noise ? tn.volume * (1 - p)
+                                           : tn.volume * Math.pow(0.0001 / tn.volume, p);
+        mix += w * env;
+        v.t += dt;
+      }
+      out[i] = Math.max(-1, Math.min(1, mix));
+    }
+  }
+}
+
+// =============================================================================
+// compiler/Lexer - Compiler Theory, independent from the game
+// =============================================================================
+
+// Categories produced by the scanner. Spaces and comments are recognised too,
+// so the game can show them on the conveyor, but they never become tokens.
+const Tok = { Id: 'Id', Num: 'Num', Op: 'Op', Sym: 'Sym', Space: 'Space', Comment: 'Comment' };
+
+class LexicalError extends Error {
+  constructor(message, column) {
+    super(message);
+    this.column = column;  // 1-based
+  }
+}
+
+const isLetter = c => /^[A-Za-z_]$/.test(c);
+const isDigit = c => c >= '0' && c <= '9';
+const isSpace = c => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+const isOneOf = (c, set) => c !== '' && set.includes(c);
+
+// The scanner: reads the line character by character, always taking the
+// longest possible lexeme (maximal munch). Throws LexicalError on bad input.
+// Each lexeme: { type, text, start, end } with [start, end) inside the line.
+function tokenize(src) {
+  const out = [];
+  let i = 0;
+  while (i < src.length) {
+    const start = i;
+    const c = src[i];
+    let type;
+    if (isSpace(c)) {
+      while (i < src.length && isSpace(src[i])) i++;
+      type = Tok.Space;
+    } else if (src.startsWith('//', i)) {  // must be checked before '/' as an operator
+      i = src.length;
+      type = Tok.Comment;
+    } else if (isLetter(c)) {
+      while (i < src.length && (isLetter(src[i]) || isDigit(src[i]))) i++;
+      type = Tok.Id;
+    } else if (isDigit(c)) {
+      while (i < src.length && isDigit(src[i])) i++;
+      type = Tok.Num;
+    } else if (isOneOf(c, '=+-*/')) {
+      i++;
+      type = Tok.Op;
+    } else if (isOneOf(c, ';(),')) {
+      i++;
+      type = Tok.Sym;
+    } else {
+      const column = i + 1;
+      throw new LexicalError(`unexpected character '${c}' at column ${column}`, column);
+    }
+    out.push({ type, text: src.substring(start, i), start, end: i });
+  }
+  return out;
+}
+
+function tokName(type) {
+  switch (type) {
+    case Tok.Id: return 'ID';
+    case Tok.Num: return 'NUM';
+    case Tok.Op: return 'OP';
+    case Tok.Sym: return 'SYM';
+    case Tok.Space: return 'SPACE';
+    case Tok.Comment: return 'COMMENT';
+  }
+  return '?';
+}
+
+function isDiscarded(type) { return type === Tok.Space || type === Tok.Comment; }  // spaces and comments
+
+function formatToken(lexeme) {  // e.g. "<ID,RES>"
+  return '<' + tokName(lexeme.type) + ',' + lexeme.text.toUpperCase() + '>';
+}
+
+// =============================================================================
+// game/Building, game/FloorReport
+// =============================================================================
+
+// The single line of code that travels up the building, floor by floor.
+const ORDER_OF_THE_DAY = 'res = a1+b2*10; // sum';
+
+const TOP_FLOOR = 6;
+const FLOOR_NAMES = [
+  'GROUND - RECEPTION', 'FLOOR 1 - SORTING', 'FLOOR 2 - ASSEMBLY', 'FLOOR 3 - INSPECTION',
+  'FLOOR 4 - DISASSEMBLY', 'FLOOR 5 - COST CUTTING', 'FLOOR 6 - THE BOSS',
+];
+
+// What a floor hands over when its quota is met (shown on the end screen).
+function makeFloorReport() {
+  return {
+    floor: 0,
+    outputTitle: '',  // e.g. "LEXICAL ANALYSIS OUTPUT, SENT TO FLOOR 2:"
+    output: '',       // what this compiler phase produced
+    warnings: 0,
+    frames: 0,        // time spent, at 60 frames per second
+  };
+}
+
+const pad2 = n => String(n).padStart(2, '0');
+
+// =============================================================================
+// game/Sfx - every sound effect in the game, built from synth tones.
+// =============================================================================
+
+class Sfx {
+  constructor(synth) { this.synth = synth; }
+
+  tone(freq, duration, wave = Wave.Square, volume = 0.04, slideTo = 0, delay = 0) {
+    this.synth.play({ freq, duration, wave, volume, slideTo, delay });
+  }
+
+  tick() { this.tone(1200, 0.015, Wave.Square, 0.01); }  // typewriter
+
+  pickUp() {
+    this.tone(440, 0.06);
+    this.tone(660, 0.06, Wave.Square, 0.04, 0, 0.05);
+  }
+
+  correct() {
+    this.tone(523, 0.07);
+    this.tone(659, 0.07, Wave.Square, 0.04, 0, 0.07);
+    this.tone(784, 0.10, Wave.Square, 0.04, 0, 0.14);
+  }
+
+  wrong() { this.tone(140, 0.3, Wave.Saw, 0.05, 90); }
+  shred() { this.tone(1, 0.35, Wave.Noise, 0.06); }
+
+  ding(delay = 0) {
+    this.tone(1318, 0.5, Wave.Triangle, 0.06, 0, delay);
+    this.tone(1046, 0.7, Wave.Triangle, 0.05, 0, delay + 0.18);
+  }
+
+  hum() { this.tone(70, 1.6, Wave.Square, 0.02, 95); }  // elevator
+
+  alarm() {
+    this.tone(880, 0.15, Wave.Square, 0.03);
+    this.tone(660, 0.15, Wave.Square, 0.03, 0, 0.16);
+  }
+
+  bump() { this.tone(110, 0.05, Wave.Square, 0.03); }  // walking into a wall
+  fire() { this.tone(1, 0.08, Wave.Noise, 0.02); }
+  scorch() { this.tone(1, 0.6, Wave.Noise, 0.08); }
+  bossVoice() { this.tone(98, 0.06, Wave.Saw, 0.035, 82); }  // the Boss "typing" his lines
+
+  lightsOn() {  // a fluorescent tube kicking in
+    this.tone(1, 0.04, Wave.Noise, 0.05);
+    this.tone(120, 0.25, Wave.Square, 0.02, 0, 0.03);
+  }
+
+  diskDrive() { this.tone(1, 0.02, Wave.Noise, 0.025); }  // one click of the floppy reader working
+}
+
+// =============================================================================
+// game/Dialog - the 40 px text box at the bottom: memos, errors, dialogue.
+// Text is typed out letter by letter; A (Z key) skips or advances.
+// =============================================================================
+
+// What the typing sounds like: the typewriter tick, or the Boss's deep voice.
+const Voice = { Typewriter: 'Typewriter', Boss: 'Boss' };
+
+const charCount = page => page.reduce((n, line) => n + line.length, 0);
+
+class Dialog {
+  constructor() {
+    this.pages = [];
+    this.page = 0;
+    this.chars = 0;
+    this.onClose = null;
+    this.voice_ = Voice.Typewriter;
+  }
+
+  // Each text is wrapped and split into as many pages as it needs.
+  open(texts, onClose = null, voice = Voice.Typewriter) {
+    this.pages = [];
+    this.page = 0;
+    this.chars = 0;
+    this.voice_ = voice;
+    for (const text of texts) {
+      const lines = font.wrap(text, Dialog.CHARS_PER_LINE);
+      for (let i = 0; i < lines.length; i += Dialog.LINES_PER_PAGE)
+        this.pages.push(lines.slice(i, Math.min(i + Dialog.LINES_PER_PAGE, lines.length)));
+    }
+    this.onClose = onClose;
+  }
+
+  isOpen() { return this.pages.length > 0; }
+  isTyping() { return this.isOpen() && this.chars < charCount(this.pages[this.page]); }  // still being typed out
+  voice() { return this.voice_; }
+
+  update(input, sfx) {
+    if (!this.isOpen()) return;
+    const total = charCount(this.pages[this.page]);
+    if (this.chars < total) {
+      const before = Math.trunc(this.chars);
+      this.chars = Math.min(total, this.chars + 1.5);
+      const now = Math.trunc(this.chars);
+      if (now !== before && now % 3 === 0) {
+        if (this.voice_ === Voice.Boss) sfx.bossVoice();
+        else sfx.tick();
+      }
+    }
+    if (!input.pressed(Key.A)) return;
+
+    if (this.chars < total) {
+      this.chars = total;  // show the whole page at once
+    } else if (this.page + 1 < this.pages.length) {
+      this.page++;
+      this.chars = 0;
+    } else {
+      // Close first: the callback may want to open another dialog
+      const callback = this.onClose;
+      this.onClose = null;
+      this.pages = [];
+      this.page = 0;
+      this.chars = 0;
+      if (callback) callback();
+    }
+  }
+
+  draw(c, frame) {
+    if (!this.isOpen()) return;
+    const y0 = SCREEN_H - Dialog.HEIGHT;
+    c.rect(0, y0, SCREEN_W, Dialog.HEIGHT, Ink);
+    c.line(0, y0, SCREEN_W - 1, y0, Light);
+    c.outline(2, y0 + 2, SCREEN_W - 4, Dialog.HEIGHT - 4, Dark);
+
+    const page = this.pages[this.page];
+    let left = Math.trunc(this.chars);
+    for (let i = 0; i < page.length; i++) {
+      const n = Math.max(0, Math.min(left, page[i].length));
+      font.drawText(c, page[i].substring(0, n), 7, y0 + 6 + i * 8, Vivid);
+      left -= page[i].length;
+    }
+    // Blinking "more" arrow once the page is fully typed
+    if (Math.trunc(this.chars) >= charCount(page) && (frame >> 4) % 2 === 0) {
+      const ax = SCREEN_W - 13, ay = y0 + 31;
+      c.rect(ax, ay, 5, 1, Vivid);
+      c.rect(ax + 1, ay + 1, 3, 1, Vivid);
+      c.pixel(ax + 2, ay + 2, Vivid);
+    }
+  }
+}
+Dialog.HEIGHT = 40;
+Dialog.CHARS_PER_LINE = 56;
+Dialog.LINES_PER_PAGE = 4;
+
+// =============================================================================
+// game/Scene - one screen of the game: title, elevator, a floor, the end screen...
+//   update(game): one fixed 60 Hz step;  draw(canvas): redraws the whole screen.
+// A SceneFactory is just a function that returns a new scene.
+// =============================================================================
+
+// =============================================================================
+// game/scenes/TitleScene - the CORPORATION's silhouette and the FEED THE MACHINE sign.
+// =============================================================================
+
+class TitleScene {
+  constructor() { this.frame = 0; }
+
+  update(game) {
+    this.frame++;
+    if (game.input().pressed(Key.Start)) game.startShift();
+  }
+
+  draw(c) {
+    const frame = this.frame;
+    c.clear(Ink);
+
+    // Smog: nobody here remembers the sun
+    for (let y = 0; y < 100; y += 3)
+      for (let x = (y * 7) % 5; x < SCREEN_W; x += 5) c.pixel(x, y, Dark);
+
+    // Neighbouring buildings, dithered
+    const others = [[14, 50, 46], [176, 54, 62]];  // x, width, height
+    for (const o of others)
+      for (let y = SCREEN_H - o[2]; y < SCREEN_H; y++)
+        for (let x = o[0]; x < o[0] + o[1]; x++)
+          if ((x + y) % 2 === 0) c.pixel(x, y, Dark);
+
+    // The CORPORATION, 7 storeys; the top one (THE BOSS) blinks
+    const bx = 78, bw = 84, by = 58;
+    c.rect(bx, by, bw, SCREEN_H - by, Dark);
+    c.outline(bx, by, bw, SCREEN_H - by, Ink);
+    for (let k = 0; k < 7; k++) {
+      const fy = SCREEN_H - 4 - 14 * (k + 1);
+      for (let wx = bx + 5; wx < bx + bw - 6; wx += 8) {
+        const window = k === 6 ? ((frame >> 3) % 2 ? Vivid : Light)
+                               : (hash2(k, wx) % 4 === 0 ? Light : Ink);
+        c.rect(wx, fy + 4, 4, 7, window);
+      }
+      c.line(bx, fy + 13, bx + bw - 1, fy + 13, Ink);
+    }
+    c.line(bx + bw - 14, by - 16, bx + bw - 14, by - 1, Dark);  // antenna
+    if ((frame >> 4) % 2) c.pixel(bx + bw - 14, by - 17, Alert);
+    c.rect(0, SCREEN_H - 4, SCREEN_W, 4, Ink);
+    c.line(0, SCREEN_H - 4, SCREEN_W - 1, SCREEN_H - 4, Light);
+
+    // Sign, with a drop shadow
+    const rows = [{ text: 'FEED THE', y: 10 }, { text: 'MACHINE', y: 30 }];
+    for (const r of rows) {
+      font.drawText(c, r.text, Math.trunc((SCREEN_W - font.width(r.text, 3)) / 2) + 2, r.y + 2, Dark, 3);
+      font.drawCentered(c, r.text, r.y, Vivid, 3);
+    }
+    font.drawCentered(c, 'FLOOR 1: SORTING', 50, Light);
+
+    if ((frame >> 5) % 2 === 0) {
+      c.rect(70, 140, 100, 11, Ink);
+      font.drawCentered(c, 'PRESS ENTER', 143, Vivid);
+    }
+  }
+}
+
+// =============================================================================
+// game/scenes/ElevatorScene - between floors: the dial sweeps from one floor to the next.
+// =============================================================================
+
+const DING_AT = 100;
+const LEAVE_AT = 140;
+
+class ElevatorScene {
+  constructor(game, fromFloor, toFloor, next) {
+    this.from = fromFloor;
+    this.to = toFloor;
+    this.next = next;
+    this.t = 0;
+    game.sfx().hum();
+  }
+
+  update(game) {
+    this.t++;
+    if (this.t === DING_AT) game.sfx().ding();
+    if (this.t === LEAVE_AT) game.transitionTo(this.next);
+  }
+
+  draw(c) {
+    c.clear(Ink);
+    const cx = 120, cy = 78, r = 34;
+    const T = Math.trunc;
+    font.drawCentered(c, 'SERVICE ELEVATOR', 14, Dark);
+
+    // Dial: midpoint-circle arc with one tick per floor
+    c.upperArc(cx, cy, r, Light);
+    c.upperArc(cx, cy, r - 1, Dark);
+    for (let k = 0; k <= TOP_FLOOR; k++) {
+      const ang = Math.PI - k * Math.PI / TOP_FLOOR;
+      const color = k === this.to ? Vivid : Light;
+      c.line(T(cx + Math.cos(ang) * (r - 4)), T(cy - Math.sin(ang) * (r - 4)),
+             T(cx + Math.cos(ang) * (r - 9)), T(cy - Math.sin(ang) * (r - 9)), color);
+      font.drawText(c, k === 0 ? 'G' : String(k), T(cx + Math.cos(ang) * (r + 7)) - 1,
+                    T(cy - Math.sin(ang) * (r + 7)) - 2, color);
+    }
+
+    // Needle, eased with smoothstep
+    const p = Math.min(1, this.t / 90), eased = p * p * (3 - 2 * p);
+    const ang = Math.PI - lerp(this.from, this.to, eased) * Math.PI / TOP_FLOOR;
+    c.line(cx, cy, T(cx + Math.cos(ang) * (r - 6)), T(cy - Math.sin(ang) * (r - 6)), Vivid);
+    c.rect(cx - 2, cy - 2, 5, 5, Vivid);
+    c.rect(cx - 60, cy + 4, 120, 1, Light);
+
+    const number = String(this.to);
+    const blink = this.t > DING_AT && (this.t >> 3) % 2;
+    font.drawText(c, number, cx - T(font.width(number, 4) / 2), cy + 14, blink ? Light : Vivid, 4);
+    font.drawCentered(c, FLOOR_NAMES[this.to], cy + 42, Light);
+  }
+}
+
+// =============================================================================
+// game/scenes/FloorCompleteScene - what this compiler phase produced, warnings and time.
+// =============================================================================
+
+class FloorCompleteScene {
+  constructor(report) {
+    this.report = report;
+    this.frame = 0;
+  }
+
+  update(game) {
+    this.frame++;
+    if (game.input().pressed(Key.A)) game.rideToTopFloor(this.report.floor);
+  }
+
+  draw(c) {
+    const report = this.report;
+    c.clear(Ink);
+    font.drawCentered(c, 'FLOOR ' + report.floor + ' COMPLETE', 12, Vivid, 2);
+    font.drawCentered(c, report.outputTitle, 36, Light);
+
+    let y = 48;
+    for (const line of font.wrap(report.output, 54)) {
+      font.drawCentered(c, line, y, Vivid);
+      y += 9;
+    }
+
+    const seconds = Math.floor(report.frames / 60);
+    const stats = `WARNINGS: ${report.warnings}/3      TIME: ${pad2(Math.floor(seconds / 60))}:${pad2(seconds % 60)}`;
+    font.drawCentered(c, stats, 82, Vivid);
+    font.drawCentered(c, report.warnings === 0 ? 'STATUS: EMPLOYEE OF THE MONTH CANDIDATE' : 'STATUS: UNDER HR OBSERVATION',
+                      96, Light);
+
+    font.drawCentered(c, 'NEXT: ' + FLOOR_NAMES[TOP_FLOOR], 118, Dark);
+    if ((this.frame >> 5) % 2 === 0) font.drawCentered(c, 'Z: TAKE THE ELEVATOR', 142, Vivid);
+  }
+}
+
+// =============================================================================
+// game/scenes/EndScene - the shift is over. Totals cover every floor played.
+// =============================================================================
+
+class EndScene {
+  constructor(totalFrames, totalWarnings) {
+    this.frames = totalFrames;
+    this.warnings = totalWarnings;
+    this.frame = 0;
+  }
+
+  update(game) {
+    this.frame++;
+    if (game.input().pressed(Key.A)) game.goToTitle();
+  }
+
+  draw(c) {
+    c.clear(Ink);
+    font.drawCentered(c, 'SHIFT OVER', 34, Vivid, 3);
+    font.drawCentered(c, 'YOU MAY CLOCK OUT NOW.', 62, Light);
+
+    const seconds = Math.floor(this.frames / 60);
+    const stats = `SHIFT TIME: ${pad2(Math.floor(seconds / 60))}:${pad2(seconds % 60)}      WARNINGS: ${this.warnings}`;
+    font.drawCentered(c, stats, 92, Vivid);
+
+    if ((this.frame >> 5) % 2 === 0) font.drawCentered(c, 'Z: NEW SHIFT', 142, Vivid);
+  }
+}
+
+// =============================================================================
+// game/floor/TileMap - a single-screen room: 15x10 tiles of 16x16 px.
+// Shared legend:  W wall   . floor   P pillar   K crates   E elevator door
+// Each floor adds its own letters for its machines.
+// =============================================================================
+
+const TILE = 16;
+
+class TileMap {
+  constructor(rows) {
+    if (rows.length !== TileMap.ROWS) throw new Error('TileMap: wrong number of rows');
+    for (const row of rows)
+      if (row.length !== TileMap.COLS) throw new Error('TileMap: row of wrong width: ' + row);
+    this.rows = rows;
+  }
+
+  at(tx, ty) {  // out of bounds counts as wall
+    if (tx < 0 || ty < 0 || tx >= TileMap.COLS || ty >= TileMap.ROWS) return 'W';
+    return this.rows[ty][tx];
+  }
+}
+TileMap.COLS = SCREEN_W / TILE;
+TileMap.ROWS = SCREEN_H / TILE;
+
+// =============================================================================
+// game/floor/Scenery - brutalist tiles shared by every floor, drawn procedurally.
+// =============================================================================
+
+const scenery = {
+  floorTile(c, x0, y0) {  // concrete slabs
+    for (let j = 0; j < TILE; j++)
+      for (let i = 0; i < TILE; i++) {
+        const x = x0 + i, y = y0 + j;
+        let color = Dark;
+        if (x % 32 === 0 || y % 32 === 0) {
+          color = Ink;  // joints between slabs
+        } else {
+          const h = hash2(x, y) % 61;
+          if (h === 0) color = Light;
+          else if (h === 1) color = Ink;
+        }
+        c.pixel(x, y, color);
+      }
+  },
+
+  wallTile(c, x0, y0) {  // formwork panels with tie holes
+    for (let j = 0; j < TILE; j++)
+      for (let i = 0; i < TILE; i++) {
+        const x = x0 + i, y = y0 + j;
+        let color = Ink;
+        if (x % 32 === 0 || y % 16 === 8) color = Dark;                                 // formwork joints
+        else if (y % 16 === 12 && (x % 32 === 8 || x % 32 === 24)) color = Light;       // tie holes
+        else if (hash2(x, y) % 47 === 0) color = Dark;
+        c.pixel(x, y, color);
+      }
+  },
+
+  pillar(c, x0, y0) {
+    c.rect(x0 + 1, y0 + 1, 14, 14, Light);
+    c.outline(x0 + 1, y0 + 1, 14, 14, Ink);
+    c.rect(x0 + 3, y0 + 3, 10, 10, Dark);
+    c.pixel(x0 + 5, y0 + 5, Ink);
+    c.pixel(x0 + 10, y0 + 5, Ink);
+    c.pixel(x0 + 5, y0 + 10, Ink);
+    c.pixel(x0 + 10, y0 + 10, Ink);
+    c.rect(x0 + 2, y0 + 15, 14, 1, Ink);  // shadow
+  },
+
+  crate(c, x0, y0) {
+    c.rect(x0 + 1, y0 + 2, 14, 13, Dark);
+    c.outline(x0 + 1, y0 + 2, 14, 13, Ink);
+    c.line(x0 + 2, y0 + 3, x0 + 13, y0 + 13, Ink);
+    c.line(x0 + 13, y0 + 3, x0 + 2, y0 + 13, Ink);
+    c.rect(x0 + 2, y0 + 3, 12, 1, Light);
+  },
+};
+
+// =============================================================================
+// game/floor/Player - John Characterman. Moves tile by tile like a GBA RPG:
+// a quick tap only turns him, holding the arrow walks.
+// =============================================================================
+
+const Dir = { Up: 'Up', Down: 'Down', Left: 'Left', Right: 'Right' };
+const dirX = d => d === Dir.Left ? -1 : d === Dir.Right ? 1 : 0;
+const dirY = d => d === Dir.Up ? -1 : d === Dir.Down ? 1 : 0;
+
+const TURN_DELAY = 5;
+const BUMP_COOLDOWN = 16;
+
+// Art lives in assets/player.png (embedded below as ASSET_PNG.player):
+// a 96x16 sheet, six 16x16 frames in a row, in this order.
+const FRAME_W = 16, FRAME_H = 16;
+let workerSpritesCache = null;
+function workerSprites() {
+  if (!workerSpritesCache) {
+    const sheet = ASSETS.player;
+    const frame = index => crop(sheet, index * FRAME_W, 0, FRAME_W, FRAME_H);
+    workerSpritesCache = {
+      front: frame(0), frontStep: frame(1), back: frame(2), backStep: frame(3), side: frame(4), sideStep: frame(5),
+    };
+  }
+  return workerSpritesCache;
+}
+
+class Player {
+  constructor(tx, ty, facing) {
+    this.charred_ = false;
+    this.bumpCooldown = 0;  // keeps the bump sound from machine-gunning
+    this.place(tx, ty, facing);
+  }
+
+  place(tx, ty, facing) {  // teleport (tests, cutscenes)
+    this.tx = tx;
+    this.ty = ty;
+    this.x_ = tx * TILE;
+    this.y_ = ty * TILE;
+    this.dir = facing;
+    this.moving = false;
+    this.fromX = this.fromY = this.toX = this.toY = 0;
+    this.progress = this.anim = this.turnDelay = 0;
+  }
+
+  // Advances the current step or starts a new one from the arrows.
+  // Returns true on the frame a step ends (the worker just arrived on a tile).
+  update(input, sfx, canWalk, isWalkable) {
+    if (this.moving) {
+      this.progress++;
+      this.anim++;
+      const f = this.progress / Player.STEP_FRAMES;
+      this.x_ = lerp(this.fromX, this.toX, f) * TILE;
+      this.y_ = lerp(this.fromY, this.toY, f) * TILE;
+      if (this.progress < Player.STEP_FRAMES) return false;
+      this.moving = false;
+      this.tx = this.toX;
+      this.ty = this.toY;
+      this.x_ = this.tx * TILE;
+      this.y_ = this.ty * TILE;
+      return true;
+    }
+    if (!canWalk) return false;
+
+    let wanted = null;
+    if (input.held(Key.Up)) wanted = Dir.Up;
+    if (input.held(Key.Down)) wanted = Dir.Down;
+    if (input.held(Key.Left)) wanted = Dir.Left;
+    if (input.held(Key.Right)) wanted = Dir.Right;
+
+    if (wanted === null) {
+      this.turnDelay = this.anim = this.bumpCooldown = 0;
+      return false;
+    }
+    if (wanted !== this.dir) {
+      this.dir = wanted;
+      this.turnDelay = TURN_DELAY;
+    } else if (this.turnDelay > 0) {
+      this.turnDelay--;
+    } else {
+      const nx = this.tx + dirX(this.dir), ny = this.ty + dirY(this.dir);
+      if (isWalkable(nx, ny)) {  // collision is just "is the next tile free?"
+        this.moving = true;
+        this.progress = 0;
+        this.fromX = this.tx;
+        this.fromY = this.ty;
+        this.toX = nx;
+        this.toY = ny;
+      } else if (this.bumpCooldown-- <= 0) {
+        sfx.bump();
+        this.bumpCooldown = BUMP_COOLDOWN;
+      }
+    }
+    return false;
+  }
+
+  // forceColor >= 0 draws him as a one-color silhouette (e.g. in the dark).
+  draw(c, forceColor = -1) {
+    const s = workerSprites();
+    const phase = (this.anim >> 2) % 4;  // step, stand, other step, stand
+    const stepping = this.moving && (phase === 0 || phase === 2);
+    const otherFoot = this.moving && phase === 2;
+
+    let sprite = null;
+    let flip = false;
+    switch (this.dir) {
+      case Dir.Down: sprite = stepping ? s.frontStep : s.front; flip = otherFoot; break;
+      case Dir.Up: sprite = stepping ? s.backStep : s.back; flip = otherFoot; break;
+      case Dir.Left:
+      case Dir.Right: sprite = stepping ? s.sideStep : s.side; flip = this.dir === Dir.Left; break;
+    }
+    blit(c, sprite, Math.trunc(this.x_), Math.trunc(this.y_), flip, this.charred_ ? Ink : forceColor);
+  }
+
+  tileX() { return this.tx; }
+  tileY() { return this.ty; }
+  facingTileX() { return this.tx + dirX(this.dir); }
+  facingTileY() { return this.ty + dirY(this.dir); }
+  x() { return this.x_; }  // pixel position, interpolated while walking
+  y() { return this.y_; }
+  facing() { return this.dir; }
+  isMoving() { return this.moving; }
+
+  charred() { return this.charred_; }
+  setCharred(charred) { this.charred_ = charred; }
+}
+Player.STEP_FRAMES = 8;  // 16 px in 8 frames = 2 px per frame
+
+// =============================================================================
+// game/floor/ElevatorDoor - the service elevator in the right wall. Locked until the quota is met.
+// =============================================================================
+
+class ElevatorDoor {
+  constructor(x, y) {
+    this.x = x;  // top-left pixel of the 16x32 door
+    this.y = y;
+    this.open_ = false;
+    this.progress = 0;  // 0 = shut, 1 = fully slid open
+  }
+
+  open() { this.open_ = true; }
+  isOpen() { return this.open_; }
+  fullyOpen() { return this.open_ && this.progress >= 1; }
+
+  update() {
+    if (this.open_) this.progress = Math.min(1, this.progress + 0.04);
+  }
+
+  draw(c, frame) {
+    const x = this.x, y = this.y;
+    c.rect(x, y, 16, 32, Ink);
+    c.outline(x + 1, y, 14, 32, this.open_ ? Vivid : Light);
+    c.rect(x + 2, y + 1, 12, 30, Ink);  // the dark car behind the doors
+
+    const gap = Math.round(this.progress * 6);
+    if (gap < 6) {
+      c.rect(x + 2, y + 1, 6 - gap, 30, Dark);
+      c.rect(x + 8 + gap, y + 1, 6 - gap, 30, Dark);
+      c.line(x + 2, y + 1, x + 2, y + 30, Light);
+      c.line(x + 13, y + 1, x + 13, y + 30, Light);
+    }
+    const lamp = this.open_ ? ((frame >> 4) % 2 === 0 ? Vivid : Light) : Dark;
+    c.rect(x + 5, y - 6, 6, 4, Ink);
+    c.rect(x + 6, y - 5, 4, 2, lamp);
+  }
+}
+
+// =============================================================================
+// game/floor/Particles - sparks, paper bits, fire and smoke: tiny squares with velocity and gravity.
+// =============================================================================
+
+class Particles {
+  constructor() { this.list = []; }
+
+  emit(x, y, vx, vy, life, color, size = 1, gravity = 0) {
+    this.list.push({ x, y, vx, vy, life, color, size, gravity });
+  }
+
+  update() {
+    for (const p of this.list) {
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += p.gravity;
+      p.life--;
+    }
+    this.list = this.list.filter(p => p.life > 0);
+  }
+
+  draw(c) {
+    for (const p of this.list) c.rect(Math.trunc(p.x), Math.trunc(p.y), p.size, p.size, p.color);
+  }
+}
+
+// =============================================================================
+// game/floor/Flamethrower - YOU ARE FIRED: comes down from the ceiling, chases the worker, scorches him.
+// =============================================================================
+
+const FT_CEILING = 12;          // just under the HUD
+const FT_DESCEND_SPEED = 0.6;   // slow and dramatic, not a snap down
+const FT_HEADSTART_FRAMES = 60; // pauses at the ceiling: a one-second head start
+const FT_MAX_SPEED = 2.6;       // the worker walks at 2 px/frame: he cannot escape
+const FT_AFTERMATH_FRAMES = 90;
+
+const FlameEvent = { None: 0, Scorched: 1, Finished: 2 };
+const FlamePhase = { Idle: 0, Descending: 1, Headstart: 2, Chasing: 3, Burnt: 4 };
+
+class Flamethrower {
+  constructor() {
+    this.phase = FlamePhase.Idle;
+    this.x = 0;
+    this.y = 0;
+    this.speed = 0.7;
+    this.t = 0;
+    this.headstart = 0;
+  }
+
+  start(x) {
+    this.phase = FlamePhase.Descending;
+    this.x = x;
+    this.y = -10;
+    this.speed = 0.7;
+    this.t = 0;
+    this.headstart = 0;
+  }
+
+  active() { return this.phase !== FlamePhase.Idle; }
+  // True while it's still descending or pausing at the ceiling: the worker can run free.
+  inHeadstart() { return this.phase === FlamePhase.Descending || this.phase === FlamePhase.Headstart; }
+
+  update(target, fx, sfx) {
+    if (this.phase === FlamePhase.Idle) return FlameEvent.None;
+    this.t++;
+    if (this.phase !== FlamePhase.Burnt && this.t % 40 === 1) sfx.alarm();
+
+    switch (this.phase) {
+      case FlamePhase.Descending:
+        this.y += FT_DESCEND_SPEED;
+        if (this.y >= 30) this.phase = FlamePhase.Headstart;
+        break;
+
+      case FlamePhase.Headstart:
+        if (++this.headstart >= FT_HEADSTART_FRAMES) this.phase = FlamePhase.Chasing;
+        break;
+
+      case FlamePhase.Chasing: {
+        const aimX = target.x() + 8, aimY = target.y() - 10;
+        const dx = aimX - this.x, dy = aimY - this.y, dist = Math.hypot(dx, dy);
+        this.speed = Math.min(FT_MAX_SPEED, this.speed + 0.012);
+        if (dist > 0.5) {
+          const s = Math.min(this.speed, dist);
+          this.x += dx / dist * s;
+          this.y += dy / dist * s;
+        }
+        for (let k = 0; k < 3; k++)
+          fx.emit(this.x - 2 + rand01() * 4, this.y + 9, (rand01() - 0.5) * 0.8, 1.2 + rand01() * 1.4,
+                  10 + Math.trunc(rand01() * 6), rand01() < 0.6 ? Alert : Vivid, 2);
+        if (this.t % 6 === 0) sfx.fire();
+        const hit = Math.abs(this.x - (target.x() + 8)) < 7 && Math.abs((this.y + 16) - (target.y() + 8)) < 9;
+        if (hit) {
+          this.phase = FlamePhase.Burnt;
+          this.t = 0;
+          return FlameEvent.Scorched;
+        }
+        break;
+      }
+
+      case FlamePhase.Burnt:
+        if (this.t % 4 === 0)
+          fx.emit(target.x() + 4 + rand01() * 8, target.y() + 2, (rand01() - 0.5) * 0.3, -0.5 - rand01() * 0.4, 30, Light);
+        this.y -= 0.8;  // retracts into the ceiling
+        if (this.t === FT_AFTERMATH_FRAMES) return FlameEvent.Finished;
+        break;
+    }
+    return FlameEvent.None;
+  }
+
+  draw(c, frame) {
+    if (!this.active()) return;
+    const x = Math.trunc(this.x), y = Math.trunc(this.y);
+    const top = FT_CEILING;
+    if (y > top) {  // the arm hanging from the ceiling rail
+      c.rect(x - 1, top, 3, y - top, Dark);
+      c.line(x - 2, top, x - 2, y, Ink);
+      c.line(x + 2, top, x + 2, y, Ink);
+    }
+    c.rect(x - 4, y, 9, 7, Light);
+    c.outline(x - 4, y, 9, 7, Ink);
+    c.rect(x - 1, y + 7, 3, 2, Ink);
+    c.pixel(x, y + 8, (frame >> 2) % 2 ? Alert : Vivid);
+  }
+}
+
+// =============================================================================
+// game/floor/Hud - the 12 px top bar: floor, quota, warnings, what you carry, X:ORDER.
+// =============================================================================
+
+// s: { floor, quotaDone, quotaTotal, warnings, warnBlink, holding, fired, frame }
+function drawHud(c, s) {
+  c.rect(0, 0, SCREEN_W, 12, Ink);
+  c.line(0, 11, SCREEN_W - 1, 11, Light);
+  if (s.fired) {
+    if ((s.frame >> 3) % 2 === 0) font.drawCentered(c, 'YOU ARE FIRED', 4, Alert);
+    return;
+  }
+  font.drawText(c, 'FLOOR ' + s.floor, 4, 4, Vivid);
+  font.drawText(c, 'QUOTA ' + s.quotaDone + '/' + s.quotaTotal, 38, 4, Vivid);
+  font.drawText(c, 'WARN', 80, 4, Light);
+  for (let k = 0; k < 3; k++) {
+    const x = 98 + k * 9;
+    const blinking = s.warnBlink > 0 && k === s.warnings - 1 && (s.warnBlink >> 2) % 2 === 0;
+    c.outline(x, 3, 7, 7, Light);
+    if (k < s.warnings && !blinking) c.rect(x + 1, 4, 5, 5, Alert);
+  }
+  if (s.holding) font.drawText(c, s.holding, 130, 4, Light);
+  font.drawText(c, 'X:ORDER', SCREEN_W - 4 - font.width('X:ORDER'), 4, Vivid);
+}
+
+// =============================================================================
+// game/floor/FloorScene
+// Everything every floor of the building has in common: the worker, the room,
+// the HUD, memos, warnings and dismissal, the clipboard, pause, the elevator.
+// A concrete floor (one compiler phase) only implements the hooks below.
+// =============================================================================
+
+class FloorScene {
+  constructor(game, number, map, player, elevator) {
+    this.game_ = game;
+    this.number = number;
+    this.map = map;
+    this.player_ = player;
+    this.elevator = elevator;
+    this.dialog = new Dialog();
+    this.particles = new Particles();
+    this.scriptedInput = new Input();  // the "buttons" a cutscene holds down for the worker
+    this.quotaDone = 0;
+    this.quotaTotal = 0;
+    this.frame = 0;
+
+    this.background = new Canvas();
+    this.flamethrower = new Flamethrower();
+    this.warnings_ = 0;
+    this.warnBlink = 0;
+    this.timePlayed = 0;
+    this.fired_ = false;
+    this.paused = false;
+    this.clipboardOpen = false;
+  }
+
+  // Call once right after construction: renders the scenery and opens the memo.
+  begin() {
+    const bg = this.background;
+    bg.clear();
+    for (let ty = 0; ty < TileMap.ROWS; ty++)
+      for (let tx = 0; tx < TileMap.COLS; tx++) this.drawTile(bg, this.map.at(tx, ty), tx * TILE, ty * TILE);
+
+    // Room frame shared by every floor: back wall shadow and wall edges
+    bg.line(16, 32, 223, 32, Ink);
+    bg.line(15, 32, 15, 143, Dark);
+    bg.line(224, 32, 224, 143, Dark);
+    bg.line(16, 144, 223, 144, Dark);
+    this.decorateBackground(bg);
+
+    this.dialog.open(this.openingMemo());
+  }
+
+  // ---- Hooks for each floor ----
+  openingMemo() { return []; }
+  drawTile(c, tile, x, y) {  // static scenery, drawn once
+    if (tile === 'W' || tile === 'E') {
+      scenery.wallTile(c, x, y);
+      return;
+    }
+    scenery.floorTile(c, x, y);
+    if (tile === 'P') scenery.pillar(c, x, y);
+    if (tile === 'K') scenery.crate(c, x, y);
+  }
+  decorateBackground(c) {}           // extra static details
+  updateObjects() {}                 // machines, animations
+  interact(tx, ty, tile) {}          // A pressed facing (tx, ty)
+  drawObjects(c) {}                  // under the worker
+  drawOverPlayer(c) {}               // e.g. what he carries
+  drawClipboardBody(c, x, y) {}
+  holdingLabel() { return ''; }
+  onFired() {}
+  // False during cutscenes: the worker then follows scriptedInput instead of
+  // the keyboard, and Z / X / Enter do nothing.
+  playerHasControl() { return true; }
+
+  // ---- Services for each floor ----
+  say(text) { this.dialog.open([text]); }
+
+  isWalkable(tx, ty) {
+    const t = this.map.at(tx, ty);
+    return t === '.' || (t === 'E' && this.elevator.fullyOpen());
+  }
+
+  player() { return this.player_; }
+  warnings() { return this.warnings_; }
+  fired() { return this.fired_; }
+  dialogOpen() { return this.dialog.isOpen(); }
+
+  // ---------------------------------------------------------------------------
+
+  update(_game) {
+    const game = this.game_;
+    const inp = game.input();
+    const sfx = game.sfx();
+    this.frame++;
+    this.warnBlink = Math.max(0, this.warnBlink - 1);
+    this.elevator.update();
+
+    // Overlays freeze the floor while they are up
+    if (this.dialog.isOpen()) {
+      this.dialog.update(inp, sfx);
+      return;
+    }
+    if (this.clipboardOpen) {
+      if (inp.pressed(Key.B) || inp.pressed(Key.A)) this.clipboardOpen = false;
+      return;
+    }
+    if (this.paused) {
+      if (inp.pressed(Key.Start)) this.paused = false;
+      return;
+    }
+    const control = this.playerHasControl();
+    if (!this.fired_ && control) {
+      if (inp.pressed(Key.Start)) { this.paused = true; return; }
+      if (inp.pressed(Key.B)) { this.clipboardOpen = true; sfx.pickUp(); return; }
+    }
+
+    this.timePlayed++;
+    this.updateObjects();
+
+    // While fired he can still run (but not work); once scorched he cannot move.
+    const player = this.player_;
+    const wasIdle = !player.isMoving();
+    const steering = control ? inp : this.scriptedInput;
+    const arrived = player.update(steering, sfx, !player.charred(), (x, y) => this.isWalkable(x, y));
+    this.scriptedInput.endStep();
+    if (arrived && this.map.at(player.tileX(), player.tileY()) === 'E') {
+      sfx.ding();
+      game.finishFloor(this.report());
+      return;
+    }
+    if (!this.fired_ && control && wasIdle && inp.pressed(Key.A)) this.interactWithFacingTile();
+
+    if (this.fired_) {
+      switch (this.flamethrower.update(player, this.particles, sfx)) {
+        case FlameEvent.Scorched:
+          player.setCharred(true);
+          game.shake(20);
+          sfx.scorch();
+          break;
+        case FlameEvent.Finished:
+          this.dialog.open(['YOU ARE FIRED.',
+                            'HR THANKS YOU FOR YOUR SERVICE. YOUR BADGE HAS BEEN DEACTIVATED. ' +
+                            'PRESS Z TO START YOUR SHIFT OVER.'],
+                           () => game.goToTitle());
+          break;
+      }
+    }
+    this.particles.update();
+  }
+
+  interactWithFacingTile() {
+    const fx = this.player_.facingTileX(), fy = this.player_.facingTileY();
+    const tile = this.map.at(fx, fy);
+    if (tile === 'E' && !this.elevator.isOpen()) this.say('THE ELEVATOR ONLY OPENS ONCE THE QUOTA IS MET. INTERNAL POLICY 7.');
+    else if (tile === 'K') this.say('WAREHOUSE CRATES. NOT PART OF YOUR QUOTA. DO NOT TOUCH.');
+    else this.interact(fx, fy, tile);
+  }
+
+  addWarning(explanation) {  // the third one gets you fired
+    this.warnings_++;
+    this.warnBlink = 48;
+    this.game_.shake(12);
+    this.game_.sfx().wrong();
+    const msg = 'WARNING ' + this.warnings_ + '/' + FloorScene.MAX_WARNINGS + '. ' + explanation;
+    if (this.warnings_ >= FloorScene.MAX_WARNINGS)
+      this.dialog.open([msg, 'THIRD WARNING. THE BOARD HAS BEEN NOTIFIED.'], () => this.startDismissal());
+    else
+      this.say(msg);
+  }
+
+  startDismissal() {
+    this.fired_ = true;
+    this.onFired();
+    this.flamethrower.start(this.player_.x() + 8);
+  }
+
+  completeQuota(memo) {
+    this.elevator.open();
+    this.game_.sfx().ding(0.35);
+    this.dialog.open(memo);
+  }
+
+  report() {
+    const r = makeFloorReport();
+    r.floor = this.number;
+    r.warnings = this.warnings_;
+    r.frames = this.timePlayed;
+    return r;
+  }
+
+  // ---------------------------------------------------------------------------
+
+  draw(c) {
+    c.copyFrom(this.background);
+    this.drawObjects(c);
+    this.elevator.draw(c, this.frame);
+    this.player_.draw(c);
+    this.drawOverPlayer(c);
+    this.particles.draw(c);
+    this.flamethrower.draw(c, this.frame);
+    drawHud(c, {
+      floor: this.number, quotaDone: this.quotaDone, quotaTotal: this.quotaTotal, warnings: this.warnings_,
+      warnBlink: this.warnBlink, holding: this.holdingLabel(), fired: this.fired_, frame: this.frame,
+    });
+    if (this.fired_ && this.flamethrower.inHeadstart()) this.drawFiredBanner(c);
+    if (this.clipboardOpen) this.drawClipboard(c);
+    if (this.paused) this.drawPause(c);
+    this.dialog.draw(c, this.frame);
+  }
+
+  drawClipboard(c) {
+    const x0 = 16, y0 = 20, w = 208, h = 96;
+    c.rect(x0 + 3, y0 + 3, w, h, Ink);  // drop shadow
+    c.rect(x0, y0, w, h, Light);
+    c.outline(x0, y0, w, h, Ink);
+    c.rect(x0 + 4, y0 + 6, w - 8, h - 10, Vivid);  // paper
+    c.rect(x0 + w / 2 - 14, y0 - 2, 28, 7, Dark);  // clip
+    c.outline(x0 + w / 2 - 14, y0 - 2, 28, 7, Ink);
+    font.drawText(c, 'CLIPBOARD - ORDER OF THE DAY', x0 + 8, y0 + 11, Ink);
+    this.drawClipboardBody(c, x0 + 8, y0 + 22);
+    font.drawText(c, 'X: CLOSE', x0 + w - 8 - font.width('X: CLOSE'), y0 + h - 11, Dark);
+  }
+
+  drawPause(c) {
+    c.rect(60, 56, 120, 40, Ink);
+    c.outline(60, 56, 120, 40, Vivid);
+    font.drawCentered(c, 'PAUSED', 64, Vivid, 2);
+    font.drawCentered(c, 'ENTER: RESUME', 84, Light);
+  }
+
+  drawFiredBanner(c) {
+    if ((this.frame >> 3) % 2 !== 0) return;  // urgent blink
+    const text = 'YOU ARE FIRED';
+    const scale = 4;
+    const x = Math.trunc((SCREEN_W - font.width(text, scale)) / 2), y = 66;
+    for (let dx = -scale; dx <= scale; dx += scale)      // thick outline so it reads over anything
+      for (let dy = -scale; dy <= scale; dy += scale)
+        if (dx || dy) font.drawText(c, text, x + dx, y + dy, Ink, scale);
+    font.drawText(c, text, x, y, Alert, scale);
+  }
+}
+FloorScene.MAX_WARNINGS = 3;
+
+// =============================================================================
+// game/floor1/SortingRules - which chute each kind of lexeme goes into, and how
+// the Board explains a mistake.
+// =============================================================================
+
+const Chute = { Id: 'Id', Num: 'Num', Op: 'Op', Sym: 'Sym', Trash: 'Trash' };
+
+function chuteFor(type) {
+  switch (type) {
+    case Tok.Id: return Chute.Id;
+    case Tok.Num: return Chute.Num;
+    case Tok.Op: return Chute.Op;
+    case Tok.Sym: return Chute.Sym;
+    case Tok.Space:
+    case Tok.Comment: return Chute.Trash;
+  }
+  return Chute.Trash;
+}
+
+function chuteLabel(chute) {
+  switch (chute) {
+    case Chute.Id: return 'ID';
+    case Chute.Num: return 'NUM';
+    case Chute.Op: return 'OP';
+    case Chute.Sym: return 'SYM';
+    case Chute.Trash: return 'TRASH';
+  }
+  return '?';
+}
+
+// Map letters for the chutes on the back wall: I, N, O, S (T is the shredder)
+function isChuteTile(tile) { return tile === 'I' || tile === 'N' || tile === 'O' || tile === 'S'; }
+
+function chuteForTile(tile) {
+  switch (tile) {
+    case 'I': return Chute.Id;
+    case 'N': return Chute.Num;
+    case 'O': return Chute.Op;
+    case 'S': return Chute.Sym;
+    default: return Chute.Trash;
+  }
+}
+
+function boxLabel(lexeme) {  // what is printed on the box (max 3 chars)
+  if (lexeme.type === Tok.Space) return VISIBLE_SPACE;
+  if (lexeme.type === Tok.Comment) return '//';
+  return font.upper(lexeme.text);
+}
+
+function explanation(lexeme) {  // the Board's memo when it is mis-sorted
+  const t = "'" + font.upper(lexeme.text) + "'";
+  switch (lexeme.type) {
+    case Tok.Id: return t + ' STARTS WITH A LETTER (AND MAY HAVE DIGITS): IT IS AN IDENTIFIER. CHUTE ID.';
+    case Tok.Num: return t + ' HAS ONLY DIGITS: IT IS A NUMBER. CHUTE NUM.';
+    case Tok.Op: return t + ' IS AN OPERATOR. CHUTE OP.';
+    case Tok.Sym: return t + ' IS PUNCTUATION, A SYMBOL. CHUTE SYM.';
+    case Tok.Space: return 'SPACES ONLY SEPARATE WORDS AND NEVER BECOME TOKENS. THEY GO TO THE SHREDDER.';
+    case Tok.Comment: return 'COMMENTS ARE FOR HUMANS. THE MACHINE DISCARDS THEM: SHREDDER.';
+  }
+  return '';
+}
+
+// =============================================================================
+// game/floor1/Props - Floor 1's machines and objects.
+// =============================================================================
+
+const props = {
+  box(c, x, y, label) {
+    c.rect(x + 1, y + 2, 14, 13, Vivid);
+    c.outline(x + 1, y + 2, 14, 13, Ink);
+    c.rect(x + 2, y + 3, 12, 1, Light);   // tape
+    c.rect(x + 2, y + 13, 12, 1, Light);  // shadow
+    font.drawText(c, label, x + 8 - Math.trunc(font.width(label) / 2), y + 6, Ink);
+  },
+
+  chute(c, x, y, label) {
+    scenery.wallTile(c, x, y);
+    c.rect(x + 1, y + 1, 14, 7, Vivid);  // sign
+    font.drawText(c, label, x + 8 - Math.trunc(font.width(label) / 2), y + 2, Ink);
+    c.rect(x + 2, y + 9, 12, 7, Ink);  // mouth
+    c.outline(x + 2, y + 9, 12, 7, Vivid);
+    for (let k = 0; k < 3; k++) c.line(x + 5 + k, y + 11 + k, x + 10 - k, y + 11 + k, Light);
+  },
+
+  shredder(c, x, y, phase) {
+    c.rect(x + 1, y + 1, 30, 14, Light);
+    c.outline(x + 1, y + 1, 30, 14, Ink);
+    c.rect(x + 4, y + 3, 24, 4, Ink);
+    for (let i = 0; i < 24; i++) {  // two rows of teeth that slide while chewing
+      const a = (i + phase) % 4, b = (i + phase + 2) % 4;
+      if (a < 3) c.pixel(x + 4 + i, y + 3, Vivid);
+      if (a === 1) c.pixel(x + 4 + i, y + 4, Vivid);
+      if (b < 3) c.pixel(x + 4 + i, y + 6, Vivid);
+      if (b === 1) c.pixel(x + 4 + i, y + 5, Vivid);
+    }
+    font.drawText(c, 'TRASH', x + 16 - Math.trunc(font.width('TRASH') / 2), y + 9, Ink);
+    c.rect(x + 2, y + 15, 30, 1, Ink);
+  },
+
+  stripCurtain(c, beltY) {
+    for (const x of [2, 5, 8, 11, 14]) c.line(x, beltY + 2, x, beltY + 13, Dark);
+  },
+};
+
+// =============================================================================
+// game/floor1/Conveyor - the belt that brings the boxes in from the left wall,
+// one item per lexeme, in order. Boxes queue up behind the one waiting at the end.
+// =============================================================================
+
+class Conveyor {
+  constructor(itemCount) {
+    this.count = itemCount;
+    this.next = 0;
+    this.offset = 0;  // belt texture scroll
+    this.items = [];  // { index, x }
+  }
+
+  update() {
+    this.offset += Conveyor.SPEED;
+    const items = this.items;
+    const roomAtStart = items.length === 0 || items[items.length - 1].x >= Conveyor.X_START + Conveyor.GAP;
+    if (this.next < this.count && items.length < Conveyor.MAX_ON_BELT && roomAtStart)
+      items.push({ index: this.next++, x: Conveyor.X_START });
+
+    for (let k = 0; k < items.length; k++) {
+      const target = k === 0 ? Conveyor.X_END : items[k - 1].x - Conveyor.GAP;
+      if (items[k].x < target) items[k].x = Math.min(target, items[k].x + Conveyor.SPEED);
+    }
+  }
+
+  itemAtEnd() { return this.items.length > 0 && this.items[0].x >= Conveyor.X_END; }
+
+  takeFromEnd() {  // returns the item's index
+    return this.items.shift().index;
+  }
+
+  drawBelt(c) {
+    const Y = Conveyor.Y;
+    const off = Math.trunc(this.offset);
+    for (let x = 16; x < 96; x++) {
+      c.pixel(x, Y, Ink);
+      c.pixel(x, Y + 1, Light);
+      for (let y = Y + 2; y < Y + 14; y++) c.pixel(x, y, (((x - off) % 6) + 6) % 6 === 0 ? Ink : Dark);
+      c.pixel(x, Y + 14, Light);
+      c.pixel(x, Y + 15, Ink);
+    }
+    c.rect(94, Y + 2, 2, 12, Light);  // stopper
+  }
+
+  drawItems(c, labelOf) {
+    for (const item of this.items) props.box(c, Math.trunc(item.x), Conveyor.Y, labelOf(item.index));
+    props.stripCurtain(c, Conveyor.Y);  // drawn over the boxes still coming through the wall
+  }
+}
+Conveyor.Y = 48;           // top of the belt (tile row 3)
+Conveyor.END_TILE_X = 5;   // boxes are picked up from this tile
+Conveyor.X_START = -2;     // inside the wall opening
+Conveyor.X_END = 79;       // against the stopper
+Conveyor.SPEED = 0.6;
+Conveyor.GAP = 17;
+Conveyor.MAX_ON_BELT = 5;
+
+// =============================================================================
+// game/floor1/SortingFloor - Floor 1, the Sorting Department: lexical analysis.
+// The order of the day goes through the real scanner; each lexeme rides the
+// conveyor in a box, and the worker sorts it into the right chute.
+// =============================================================================
+
+//   V wall display   B conveyor mouth   C conveyor   T shredder
+//   I / N / O / S chutes for ID / NUM / OP / SYM
+const SORTING_MAP = [
+  'WWWWWWWWWWWWWWW',
+  'WVVVVVVIWNWOWSW',
+  'W.............W',
+  'BCCCCC........W',
+  'W.............E',
+  'W.............E',
+  'W........P....W',
+  'W.............W',
+  'WTT.........KKW',
+  'WWWWWWWWWWWWWWW',
+];
+
+const SHREDDER_X = 16, SHREDDER_Y = 128;
+const SORT_DISPLAY_X = 18, SORT_DISPLAY_Y = 21;
+const FLY_FRAMES = 10;
+
+class SortingFloor extends FloorScene {
+  constructor(game) {
+    super(game, 1, new TileMap(SORTING_MAP), new Player(13, 5, Dir.Left), new ElevatorDoor(224, 64));
+    this.lexemes = tokenize(ORDER_OF_THE_DAY);
+    this.conveyor = new Conveyor(this.lexemes.length);
+    this.holding = -1;    // lexeme index in the worker's hands
+    this.processed = 0;   // lexemes already sorted, in order
+    this.tokens = [];     // lexeme indices delivered as tokens
+    this.flying = [];     // { x, y, toX, toY, t, label, trash, sparkX }
+    this.shredFrames = 0;
+    this.quotaTotal = this.lexemes.filter(l => !isDiscarded(l.type)).length;
+  }
+
+  openingMemo() {
+    return [
+      'MEMO FROM THE BOARD\nFLOOR 1 - SORTING DEPARTMENT (LEXICAL ANALYSIS)',
+      "WELCOME TO YOUR FIRST SHIFT, JOHN CHARACTERMAN. TODAY'S ORDER ARRIVED AS RAW TEXT, " +
+      'AND THE MACHINE DOES NOT READ RAW TEXT.',
+      'THE CONVEYOR ALREADY CUTS THE LINE INTO PIECES (LEXEMES). THE DISPLAY ON THE WALL SHOWS ' +
+      'THE WHOLE LINE AND LIGHTS UP THE CURRENT PIECE.',
+      'TAKE EACH BOX FROM THE END OF THE CONVEYOR TO THE RIGHT CHUTE. EVERY BOX DELIVERED TO A ' +
+      'CHUTE BECOMES A TOKEN.',
+      'ID: NAMES. START WITH A LETTER, MAY CONTAIN DIGITS (A1).\nNUM: DIGITS ONLY (10).\n' +
+      'OP: OPERATORS (= + - * /).\nSYM: PUNCTUATION (; ( ) ,).',
+      'SPACES AND COMMENTS ARE NOT TOKENS: THEY GO TO THE SHREDDER (TRASH), IN THE BOTTOM LEFT CORNER.',
+      'EVERY MISTAKE EARNS YOU A WARNING. THREE WARNINGS: IMMEDIATE TERMINATION. THE BOARD TRUSTS ' +
+      'YOU. MORE OR LESS.',
+      'CONTROLS: ARROWS TO WALK. Z PICKS UP, DELIVERS AND INTERACTS. X OPENS THE ORDER CLIPBOARD. ' +
+      'ENTER PAUSES. QUOTA: ' + this.quotaTotal + ' TOKENS. HAVE A PRODUCTIVE SHIFT.',
+    ];
+  }
+
+  // ---- Scenery -------------------------------------------------------------
+
+  drawTile(c, tile, x, y) {
+    if (tile === 'V' || tile === 'B') scenery.wallTile(c, x, y);
+    else if (isChuteTile(tile)) props.chute(c, x, y, chuteLabel(chuteForTile(tile)));
+    else super.drawTile(c, tile, x, y);  // conveyor and shredder sit on plain floor
+  }
+
+  decorateBackground(c) {
+    c.rect(16, 17, 96, 13, Ink);  // display panel
+    c.outline(16, 17, 96, 13, Light);
+    c.rect(0, Conveyor.Y + 1, 16, 14, Ink);  // opening in the wall the boxes come through
+    c.line(0, Conveyor.Y, 15, Conveyor.Y, Light);
+    c.line(0, Conveyor.Y + 15, 15, Conveyor.Y + 15, Light);
+  }
+
+  // ---- Logic -----------------------------------------------------------------
+
+  updateObjects() {
+    this.conveyor.update();
+
+    for (const b of this.flying) {
+      if (++b.t !== FLY_FRAMES) continue;
+      if (b.trash) {  // paper bits out of the shredder
+        for (let k = 0; k < 14; k++)
+          this.particles.emit(28 + rand01() * 16, 130, (rand01() - 0.5) * 1.2, -1 - rand01() * 1.5, 25,
+                              rand01() < 0.5 ? Vivid : Light, 1, 0.08);
+      } else {  // sparks at the chute
+        for (let k = 0; k < 8; k++)
+          this.particles.emit(b.sparkX, 26, (rand01() - 0.5) * 2, -rand01() * 1.5, 14, Vivid, 1, 0.1);
+      }
+    }
+    this.flying = this.flying.filter(b => b.t < FLY_FRAMES);
+    if (this.shredFrames > 0) this.shredFrames--;
+  }
+
+  interact(tx, ty, tile) {
+    const sfx = this.game_.sfx();
+
+    if (this.holding < 0) {  // empty hands
+      if (tile === 'C') {
+        const atEnd = tx === Conveyor.END_TILE_X;
+        if (atEnd && this.conveyor.itemAtEnd()) {
+          this.holding = this.conveyor.takeFromEnd();
+          sfx.pickUp();
+        } else if (atEnd && this.processed >= this.lexemes.length) {
+          this.say('THE CONVEYOR IS EMPTY. THIS DEPARTMENT HAS MET ITS QUOTA.');
+        } else if (atEnd) {
+          this.say('THE NEXT BOX IS ON ITS WAY.');
+        } else {
+          this.say('BOXES CAN ONLY BE PICKED UP AT THE END OF THE CONVEYOR, BY THE STOPPER.');
+        }
+      } else if (isChuteTile(tile) || tile === 'T') {
+        this.say('YOUR HANDS ARE EMPTY. PICK UP A BOX AT THE END OF THE CONVEYOR.');
+      } else if (tile === 'V') {
+        this.say('CONVEYOR DISPLAY: SHOWS THE ORIGINAL LINE. THE LIT PART IS THE NEXT BOX TO BE SORTED.');
+      } else if (tile === 'B') {
+        this.say('THE ORDER LINE COMES IN HERE, ALREADY CUT INTO PIECES BY THE SCANNER.');
+      }
+      return;
+    }
+
+    // Carrying a box
+    if (isChuteTile(tile)) this.deliver(chuteForTile(tile), tx, ty);
+    else if (tile === 'T') this.deliver(Chute.Trash, tx, ty);
+    else if (tile === 'C') this.say('THE CONVEYOR ONLY MOVES FORWARD. TAKE THE BOX TO A CHUTE OR TO THE SHREDDER.');
+    else if (tile === '.') this.say('SAFETY POLICY 14.3: LEAVING BOXES ON THE FLOOR IS FORBIDDEN.');
+    else this.say('THAT IS NOT A CHUTE. THE CHUTES ARE ON THE BACK WALL; THE SHREDDER IS IN THE CORNER.');
+  }
+
+  // The lexer already decided what each lexeme is; here we only check the player agrees.
+  deliver(chute, tx, ty) {
+    const lex = this.lexemes[this.holding];
+    if (chute !== chuteFor(lex.type)) {
+      this.addWarning((chute === Chute.Trash ? 'THAT IS NOT TRASH! ' : '') + explanation(lex));
+      return;  // the box stays in his hands
+    }
+
+    const trash = chute === Chute.Trash;
+    this.flying.push({
+      x: this.player_.x(), y: this.player_.y() - 10,
+      toX: trash ? 24 : tx * TILE, toY: trash ? 120 : ty * TILE + 6,
+      t: 0, label: boxLabel(lex), trash, sparkX: tx * TILE + 8,
+    });
+    if (trash) {
+      this.shredFrames = 36;
+      this.game_.sfx().shred();
+    } else {
+      this.quotaDone++;
+      this.tokens.push(this.holding);
+      this.game_.sfx().correct();
+    }
+    this.holding = -1;
+    this.processed++;
+
+    if (this.processed === this.lexemes.length)
+      this.completeQuota([
+        'MEMO: QUOTA MET. ' + this.quotaTotal +
+          ' TOKENS WENT UP TO FLOOR 2 (ASSEMBLY). PRESS X TO SEE THE LIST.',
+        'THE ELEVATOR IS UNLOCKED. DO NOT BE LATE.',
+      ]);
+  }
+
+  tokenStream() {  // "<ID,RES> <OP,=> ..."
+    return this.tokens.map(idx => formatToken(this.lexemes[idx])).join(' ');
+  }
+
+  holdingLabel() {
+    if (this.holding < 0) return '';
+    const lex = this.lexemes[this.holding];
+    return 'BOX: ' + (lex.type === Tok.Space ? VISIBLE_SPACE : lex.text);
+  }
+
+  onFired() { this.holding = -1; }
+
+  report() {
+    const r = super.report();
+    r.outputTitle = 'LEXICAL ANALYSIS OUTPUT, SENT TO FLOOR 2:';
+    r.output = this.tokenStream();
+    return r;
+  }
+
+  boxWaiting() { return this.conveyor.itemAtEnd(); }
+
+  // ---- Drawing -----------------------------------------------------------------
+
+  drawDisplay(c) {
+    const current = this.processed < this.lexemes.length ? this.lexemes[this.processed] : null;
+    for (let i = 0; i < ORDER_OF_THE_DAY.length; i++) {
+      let color = Light;                                // still to come
+      if (!current || i < current.start) color = Dark;  // already sorted
+      else if (i < current.end) color = Vivid;          // the current piece
+      font.drawGlyph(c, ORDER_OF_THE_DAY[i], SORT_DISPLAY_X + i * 4, SORT_DISPLAY_Y, color);
+    }
+    if (current && (this.frame >> 4) % 2 === 0)
+      c.rect(SORT_DISPLAY_X + current.start * 4, SORT_DISPLAY_Y + 6, (current.end - current.start) * 4 - 1, 1, Vivid);
+  }
+
+  drawObjects(c) {
+    this.drawDisplay(c);
+    this.conveyor.drawBelt(c);
+    this.conveyor.drawItems(c, i => boxLabel(this.lexemes[i]));
+    props.shredder(c, SHREDDER_X, SHREDDER_Y, this.shredFrames > 0 ? (this.frame >> 1) % 4 : 0);
+    for (const b of this.flying) {
+      const f = b.t / FLY_FRAMES;
+      props.box(c, Math.trunc(lerp(b.x, b.toX, f)), Math.trunc(lerp(b.y, b.toY, f)), b.label);
+    }
+  }
+
+  drawOverPlayer(c) {
+    if (this.holding < 0) return;
+    props.box(c, Math.trunc(this.player_.x()), Math.trunc(this.player_.y()) - 10,
+              boxLabel(this.lexemes[this.holding]));
+  }
+
+  drawClipboardBody(c, x, y) {
+    font.drawText(c, 'ORIGINAL LINE:', x, y, Dark);
+    font.drawText(c, ORDER_OF_THE_DAY, x, y + 8, Ink);
+    font.drawText(c, 'TOKENS READY (' + this.tokens.length + '/' + this.quotaTotal + '):', x, y + 20, Dark);
+    const lines = this.tokens.length === 0 ? ['(NONE YET)'] : font.wrap(this.tokenStream(), 48);
+    let ly = y + 28;
+    for (const line of lines) {
+      font.drawText(c, line, x, ly, Ink);
+      ly += 8;
+    }
+  }
+}
+
+// =============================================================================
+// game/floor6/BossFloor - Floor 6, THE BOSS: the worker feeds the final floppy
+// disk to a giant computer. The whole scene is one small state machine: each
+// Phase lasts a number of frames or until a dialog closes, and only FeedMe
+// hands control to the player.
+// =============================================================================
+
+const Phase = { Dark: 'Dark', Lights: 'Lights', FeedMe: 'FeedMe', Loading: 'Loading', Thanks: 'Thanks', Exit: 'Exit' };
+
+//   B the Boss (monitor, tower and plinth)   R floppy reader   J junk and rubble
+// Must match assets/boss_room.png: the art is a picture, this map is what blocks the worker.
+const BOSS_MAP = [
+  'WWWWWWWWWWWWWWW',
+  'WWWWWWWWWWWWWWW',
+  'WJJBBBBBBBBBJJW',
+  'WJJBBBBBBBBBJJW',
+  'WJJBBBBBBBBB..E',
+  'WJJBBBBBBBBB..E',
+  'WJJJJJJR......W',
+  'WJJJJJJJJJJJJJW',
+  'WJJJJJJJJJJJJJW',
+  'WWWWWWWWWWWWWWW',
+];
+
+// The monitor's screen (where the face and messages go) and the reader, in pixels
+const DISPLAY_X = 68, DISPLAY_Y = 23, DISPLAY_W = 62, DISPLAY_H = 42;
+const READER_X = 113, READER_Y = 100, READER_W = 15;
+const LED_X = READER_X + READER_W - 3, LED_Y = READER_Y + 7;
+
+// Timing, in frames (60 per second)
+const DARK_FRAMES = 30;     // darkness before the Boss speaks
+const LIGHTS_FRAMES = 42;   // the fluorescent flicker
+const LOAD_FRAMES = 180;    // 0% to 99%
+const STALL_END = 300;      // ...stuck at 99% until here, then 100%
+const THANKS_AT = 330;      // 100% stays up for half a second
+const DRIVE_CLICK_EVERY = 12;
+
+// On/off pattern of a tube light struggling to start; ends on for good.
+function flickerOn(t) { return (t >= 6 && t < 9) || (t >= 15 && t < 17) || (t >= 24 && t < 31) || t >= 36; }
+
+function drawCenteredIn(c, text, y, color, scale = 1) {
+  font.drawText(c, text, DISPLAY_X + Math.trunc((DISPLAY_W - font.width(text, scale)) / 2), y, color, scale);
+}
+
+class BossFloor extends FloorScene {
+  constructor(game) {
+    super(game, TOP_FLOOR, new TileMap(BOSS_MAP), new Player(13, 5, Dir.Left), new ElevatorDoor(224, 64));
+    this.room = ASSETS.bossRoom;
+    const faces = ASSETS.bossFace;
+    this.faceShut = crop(faces, 0, 0, DISPLAY_W, DISPLAY_H);
+    this.faceOpen = crop(faces, DISPLAY_W, 0, DISPLAY_W, DISPLAY_H);
+    this.phase_ = Phase.Dark;
+    this.t = 0;  // frames spent in the current phase
+    this.diskInserted = false;
+    this.quotaTotal = 1;
+  }
+
+  phase() { return this.phase_; }
+
+  openingMemo() { return []; }  // the Boss speaks instead
+  decorateBackground(c) { blit(c, this.room, 0, 0); }
+  playerHasControl() { return this.phase_ === Phase.FeedMe; }
+
+  // ---- The sequence -----------------------------------------------------------
+
+  enter(next) {
+    this.phase_ = next;
+    this.t = 0;
+  }
+
+  bossSays(lines, then) {
+    this.dialog.open(lines, then, Voice.Boss);
+  }
+
+  updateObjects() {
+    this.t++;
+    switch (this.phase_) {
+      case Phase.Dark:
+        if (this.t === DARK_FRAMES)
+          this.bossSays(['WELCOME...', 'MR. CHARACTERMAN...'], () => {
+            this.enter(Phase.Lights);
+            this.game_.sfx().lightsOn();
+          });
+        break;
+      case Phase.Lights:
+        if (this.t >= LIGHTS_FRAMES) this.enter(Phase.FeedMe);
+        break;
+      case Phase.Loading:
+        if (this.t < STALL_END && this.t % DRIVE_CLICK_EVERY === 0) this.game_.sfx().diskDrive();
+        if (this.t === STALL_END) this.game_.sfx().ding();
+        if (this.t === THANKS_AT) {
+          this.enter(Phase.Thanks);
+          this.bossSays(['THANK YOU, MR. CHARACTERMAN.', 'YOU MAY CLOCK OUT NOW.'], () => {
+            this.enter(Phase.Exit);
+            this.elevator.open();
+          });
+        }
+        break;
+      case Phase.Exit:
+        this.walkToElevator();
+        break;
+      case Phase.FeedMe:
+      case Phase.Thanks:
+        break;
+    }
+  }
+
+  // Holds the arrow that leads him from the reader to the elevator:
+  // right along the corridor, up one tile, right into the door.
+  walkToElevator() {
+    if (!this.elevator.fullyOpen()) return;
+    const tx = this.player_.tileX(), ty = this.player_.tileY();
+    let key = Key.Right;
+    if (ty > 5 && tx >= 13) key = Key.Up;
+    this.scriptedInput.releaseAll();
+    this.scriptedInput.press(key);
+  }
+
+  interact(tx, ty, tile) {
+    if (tile === 'R') {
+      this.diskInserted = true;
+      this.quotaDone = 1;
+      this.game_.sfx().pickUp();
+      this.enter(Phase.Loading);
+    } else if (tile === 'B') {
+      this.say('THE MACHINE IS HUNGRY. THE DISK GOES IN THE READER ON THE FLOOR.');
+    } else if (tile === 'J') {
+      this.say('OBSOLETE EQUIPMENT. NOBODY HAS BEEN HERE IN YEARS.');
+    }
+  }
+
+  loadPercent() {
+    if (this.phase_ !== Phase.Loading) return this.diskInserted ? 100 : 0;
+    if (this.t < LOAD_FRAMES) return Math.floor(this.t * 99 / LOAD_FRAMES);
+    return this.t < STALL_END ? 99 : 100;
+  }
+
+  isDark() { return this.phase_ === Phase.Dark || (this.phase_ === Phase.Lights && !flickerOn(this.t)); }
+
+  holdingLabel() { return this.diskInserted ? '' : 'DISK'; }
+
+  // ---- Drawing ------------------------------------------------------------------
+
+  drawFace(c) {
+    // The mouth moves while the Boss's own lines are being typed out
+    const talking = this.dialog.voice() === Voice.Boss && this.dialog.isTyping() && (this.frame >> 2) % 2;
+    blit(c, talking ? this.faceOpen : this.faceShut, DISPLAY_X, DISPLAY_Y);
+  }
+
+  drawObjects(c) {
+    if (this.phase_ === Phase.FeedMe) {
+      if ((this.frame >> 4) % 2 === 0) {
+        drawCenteredIn(c, 'FEED ME', DISPLAY_Y + 5, Vivid, 2);
+        const ax = DISPLAY_X + DISPLAY_W / 2;  // arrow down, toward the reader
+        c.rect(ax - 2, DISPLAY_Y + 19, 5, 9, Vivid);
+        for (let k = 0; k < 7; k++) c.line(ax - 6 + k, DISPLAY_Y + 28 + k, ax + 6 - k, DISPLAY_Y + 28 + k, Vivid);
+      }
+      if ((this.frame >> 3) % 2 === 0) {  // arrow on the floor, pointing at the reader
+        const ax = 100, ay = READER_Y + 5;
+        c.rect(ax - 10, ay - 1, 8, 3, Alert);
+        for (let k = 0; k < 5; k++) c.line(ax - 2 + k, ay - 4 + k, ax - 2 + k, ay + 4 - k, Alert);
+      }
+    } else if (this.phase_ === Phase.Loading) {
+      const pct = this.loadPercent();
+      drawCenteredIn(c, 'LOADING', DISPLAY_Y + 8, Vivid);
+      c.outline(DISPLAY_X + 5, DISPLAY_Y + 18, DISPLAY_W - 10, 8, Vivid);
+      c.rect(DISPLAY_X + 7, DISPLAY_Y + 20, Math.floor((DISPLAY_W - 14) * pct / 100), 4, Vivid);
+      drawCenteredIn(c, pct + '%', DISPLAY_Y + 31, Vivid);
+    } else {
+      this.drawFace(c);
+    }
+    if (this.diskInserted) c.pixel(LED_X, LED_Y, Vivid);
+  }
+
+  // In the dark, everything the floor drew is painted over: only the face glows,
+  // and the worker is a silhouette. The HUD and the text box still go on top.
+  // With the lights on, he carries the floppy over his head until it goes in.
+  drawOverPlayer(c) {
+    if (this.isDark()) {
+      c.rect(0, 0, SCREEN_W, SCREEN_H, Ink);
+      c.outline(DISPLAY_X - 1, DISPLAY_Y - 1, DISPLAY_W + 2, DISPLAY_H + 2, Dark);
+      this.drawFace(c);
+      this.player_.draw(c, Dark);
+      return;
+    }
+    if (this.diskInserted) return;
+    const x = Math.trunc(this.player_.x()) + 4, y = Math.trunc(this.player_.y()) - 9;
+    c.rect(x, y, 8, 8, Dark);
+    c.outline(x, y, 8, 8, Ink);
+    c.rect(x + 2, y + 1, 4, 3, Light);  // label
+    c.rect(x + 3, y + 5, 2, 2, Ink);    // metal shutter
+  }
+
+  drawClipboardBody(c, x, y) {
+    font.drawText(c, 'ORIGINAL LINE:', x, y, Dark);
+    font.drawText(c, ORDER_OF_THE_DAY, x, y + 8, Ink);
+    let ly = y + 20;
+    for (const line of font.wrap('FINAL DISK: THE COMPILED PROGRAM, FROM FLOORS 1-5. DELIVER IT TO THE BOSS.', 48)) {
+      font.drawText(c, line, x, ly, Ink);
+      ly += 8;
+    }
+  }
+}
+
+// =============================================================================
+// game/Game - owns the current scene, the fades between scenes and the shared
+// services. Knows nothing about the browser: the platform layer feeds it input and audio.
+// =============================================================================
+
+class Game {
+  constructor(input, synth) {
+    this.input_ = input;
+    this.sfx_ = new Sfx(synth);
+    this.canvas_ = new Canvas();
+    this.scene_ = new TitleScene();
+    this.transition = null;  // { t, frames, next, swapped }
+    this.shift = [];         // every floor finished since clocking in
+    this.brightness = 1;
+    this.shake_ = 0;
+  }
+
+  // Services for scenes
+  input() { return this.input_; }
+  sfx() { return this.sfx_; }
+  shake(frames) { this.shake_ = Math.max(this.shake_, frames); }
+  transitionTo(next, fadeFrames = 24) {
+    this.transition = { t: 0, frames: fadeFrames, next, swapped: false };
+  }
+
+  // Inspection (debugging)
+  scene() { return this.scene_; }
+  canvas() { return this.canvas_; }
+  isTransitioning() { return this.transition !== null; }
+
+  step() {  // one fixed 60 Hz update
+    if (this.shake_ > 0) this.shake_--;
+
+    // While fading, scenes are frozen: fade out, swap the scene at black, fade in.
+    const tr = this.transition;
+    if (tr) {
+      tr.t++;
+      if (tr.t <= tr.frames) {
+        this.brightness = 1 - tr.t / tr.frames;
+      } else {
+        if (!tr.swapped) {
+          tr.swapped = true;
+          this.scene_ = tr.next();
+        }
+        this.brightness = Math.min(1, (tr.t - tr.frames) / tr.frames);
+      }
+      if (tr.t >= tr.frames * 2) {
+        this.brightness = 1;
+        this.transition = null;
+      }
+      return;
+    }
+    this.scene_.update(this);
+  }
+
+  render(rgbaOut) {  // draws the current scene, then converts it to RGBA
+    this.scene_.draw(this.canvas_);
+    let dx = 0, dy = 0;
+    if (this.shake_ > 0) {
+      dx = Math.trunc(rand01() * 3) - 1;
+      dy = Math.trunc(rand01() * 3) - 1;
+    }
+    this.canvas_.toRgba(rgbaOut, this.brightness, dx, dy);
+  }
+
+  // ---- Scene flow ---------------------------------------------------------
+
+  goToTitle() {
+    this.transitionTo(() => new TitleScene());
+  }
+
+  startShift() {
+    this.shift = [];
+    this.transitionTo(() => new ElevatorScene(this, 0, 1, () => {
+      const floor = new SortingFloor(this);
+      floor.begin();
+      return floor;
+    }));
+  }
+
+  // Report screen, or the end of the game after the top floor
+  finishFloor(report) {
+    this.shift.push(report);
+    if (report.floor < TOP_FLOOR) {
+      this.transitionTo(() => new FloorCompleteScene(report));
+      return;
+    }
+    let frames = 0, warnings = 0;
+    for (const r of this.shift) {
+      frames += r.frames;
+      warnings += r.warnings;
+    }
+    this.transitionTo(() => new EndScene(frames, warnings));
+  }
+
+  // Floors 2-5 don't exist in this demo
+  rideToTopFloor(fromFloor) {
+    this.transitionTo(() => new ElevatorScene(this, fromFloor, TOP_FLOOR, () => {
+      const floor = new BossFloor(this);
+      floor.begin();
+      return floor;
+    }));
+  }
+}
+
+// =============================================================================
+// assets/ - the exported PNGs, embedded so the page runs straight from disk
+// =============================================================================
+
+const ASSET_PNG = {
+  player: 'iVBORw0KGgoAAAANSUhEUgAAAGAAAAAQCAYAAADpunr5AAAAAXNSR0IArs4c6QAAAbRJREFUWIXtl6GOwkAQhqcX1CkEmqyoQDaVCIJEoFGXPgQPcuEJEEg0AtlcLsiGB6ho0IgqbM+wzXY6uzsthbbk/oTQbPf7d2Z3p9sC/KtVOVTjUIwyqj1NrmT/d+NbjWEoRtlv+pXJf/VaZ/pOvOqh/urEwOEdDB7OC6P50jtqV7HvfBsxOCpopJBwAH3n6/hQHlX5zlWA6wsjH0fJ03ibz2Y7seZQlf+gDJbekdWm06N8lyQnbbOd1MrBxpMLQO1i285uku+a5CTWzcHEa59huLNcPU75NsHjEo6j5CU8Jw+OB5cfYCBYz+AUXmC/uxVA1xcwnY9h9/2TUYk0zU/n41JSz+R1XjgPeb8pfqDeOJwXsPSOeRJE8HkfSn3nVQXrWaltFXzCKmiWJ8+AU3jJSxbu5YsTMulRHu4TRl2/ij+Fl1LM+92NfRBT+VI8Wca6Vznbc7TvPPaifDivsVX4QgVg4zhKCjvZFnzfedwPVzF38rHUOFxfFD7WCmeAumrqYDFA5voCXF9ADKA9gKQx3mlV+DbHt6nKGxQ3D+PnvAR17Vxx+bbHNzFc1jaWej9Nrs4fEH6pVS/qLQIAAAAASUVORK5CYII=',
+  bossRoom: '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',
+  bossFace: 'iVBORw0KGgoAAAANSUhEUgAAAHwAAAAqCAYAAABxyT9UAAABKElEQVR42u2aSxLCIBBEOajH9UDeQFcuEi2U+dCQea/KlZJM9wyTgLQGAAAAAAAAAMtxf9ye70+lGKvqPlx0NQMy46qqu2uAwoTZMVTVLTdAbXpV3VNNWLWtVtWdZsDygovrDgt6O7Ho/hSRPQbdAAAAAAAAANcnaldNNR4MZltNV4+XVvrOM7tcwiNuvFNrO9/Ls2+uGu9OtDXx3n+GVAchfnkxeo2o8dOSPTrbv/1uNHG98YrH1ohuT5fyFkxK++wF8O93FuNmnG+LKIrMgkk5zGhtt9bZazElUrw37siJMuVdRvGM9RRMZMV74vZMlOiCSU/2+Rqqta5iuRlV6JEFs9X6WnkkWLFcjS6YpY1ebWNF1Rm9BdNgvmFRHYKMUHgAAAAAcFVeSe8B2QcOU7IAAAAASUVORK5CYII=',
+};
+
+const ASSETS = {};  // name -> Sprite, filled before the game starts
+
+function loadSprite(base64) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(Sprite.fromImage(img));
+    img.onerror = () => reject(new Error("Sprite: couldn't decode PNG"));
+    img.src = 'data:image/png;base64,' + base64;
+  });
+}
+
+// =============================================================================
+// platform/WebApp - the only part of the page that talks to the browser:
+// canvas, keyboard, audio device and the fixed-timestep main loop.
+// =============================================================================
+
+const STEP_SECONDS = 1 / 60;
+
+function mapKey(code) {
+  switch (code) {
+    case 'ArrowUp':
+    case 'KeyW': return Key.Up;
+    case 'ArrowDown':
+    case 'KeyS': return Key.Down;
+    case 'ArrowLeft':
+    case 'KeyA': return Key.Left;
+    case 'ArrowRight':
+    case 'KeyD': return Key.Right;
+    case 'KeyZ': return Key.A;
+    case 'KeyX': return Key.B;
+    case 'Enter':
+    case 'NumpadEnter': return Key.Start;
+    default: return null;
+  }
+}
+
+class WebApp {
+  constructor(canvasEl) {
+    this.el = canvasEl;
+    this.ctx = canvasEl.getContext('2d');
+    this.image = this.ctx.createImageData(SCREEN_W, SCREEN_H);
+    this.input = new Input();
+    this.synth = new Synth();
+    this.audio = null;
+    this.screenshots = 0;
+    this.game = new Game(this.input, this.synth);
+  }
+
+  init() {
+    window.addEventListener('keydown', e => this.onKeyDown(e));
+    window.addEventListener('keyup', e => {
+      const key = mapKey(e.code);
+      if (key !== null) { this.input.release(key); e.preventDefault(); }
+    });
+    window.addEventListener('blur', () => this.input.releaseAll());
+    window.addEventListener('resize', () => this.fitToWindow());
+    document.addEventListener('fullscreenchange', () => this.fitToWindow());
+    this.fitToWindow();
+  }
+
+  // Largest whole-number scale that fits the window: crisp pixels
+  fitToWindow() {
+    const scale = Math.max(1, Math.floor(Math.min(window.innerWidth / SCREEN_W, window.innerHeight / SCREEN_H)));
+    this.el.style.width = SCREEN_W * scale + 'px';
+    this.el.style.height = SCREEN_H * scale + 'px';
+  }
+
+  // Browsers only allow sound after a key press, so the device opens on the first one.
+  startAudio() {
+    if (this.audio) {
+      if (this.audio.state === 'suspended') this.audio.resume();
+      return;
+    }
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      this.audio = new AudioCtx();
+      const node = this.audio.createScriptProcessor(1024, 1, 1);
+      node.onaudioprocess = e => {
+        const out = e.outputBuffer.getChannelData(0);
+        this.synth.render(out, out.length, this.audio.sampleRate);
+      };
+      node.connect(this.audio.destination);
+      this.audioNode = node;  // keep a reference so it isn't garbage-collected
+    } catch (err) {
+      console.warn('No audio:', err);  // the game still runs, silently
+    }
+  }
+
+  onKeyDown(e) {
+    this.startAudio();
+    if (e.code === 'F11') { e.preventDefault(); if (!e.repeat) this.toggleFullscreen(); return; }
+    if (e.code === 'F12') { e.preventDefault(); if (!e.repeat) this.saveScreenshot(); return; }
+    const key = mapKey(e.code);
+    if (key === null) return;
+    e.preventDefault();  // arrows must not scroll the page
+    if (!e.repeat) this.input.press(key);
+  }
+
+  toggleFullscreen() {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen();
+  }
+
+  saveScreenshot() {
+    const a = document.createElement('a');
+    a.download = 'screenshot_' + String(this.screenshots++).padStart(3, '0') + '.png';
+    a.href = this.el.toDataURL('image/png');
+    a.click();
+  }
+
+  run() {
+    let last = performance.now();
+    let accumulator = 0;
+    const frame = now => {
+      // Fixed timestep: the game always advances in 1/60 s steps,
+      // no matter how fast the monitor refreshes.
+      accumulator += Math.min(0.25, (now - last) / 1000);
+      last = now;
+      while (accumulator >= STEP_SECONDS) {
+        this.game.step();
+        this.input.endStep();
+        accumulator -= STEP_SECONDS;
+      }
+      this.game.render(this.image.data);
+      this.ctx.putImageData(this.image, 0, 0);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+}
+
+// =============================================================================
+// main
+// =============================================================================
+
+Promise.all([loadSprite(ASSET_PNG.player), loadSprite(ASSET_PNG.bossRoom), loadSprite(ASSET_PNG.bossFace)])
+  .then(([player, bossRoom, bossFace]) => {
+    ASSETS.player = player;
+    ASSETS.bossRoom = bossRoom;
+    ASSETS.bossFace = bossFace;
+    const app = new WebApp(document.getElementById('screen'));
+    app.init();
+    app.run();
+  })
+  .catch(err => console.error(err));
+</script>
+</body>
+</html>
